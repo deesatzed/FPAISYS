@@ -1,0 +1,6 @@
+{
+  "schema": "sese-synthetic-review-card-v1",
+  "human": "Review the effect of throttling this synthetic event.",
+  "bridge": "Compare the replay cases and champion/shadow verdicts.",
+  "proposal": "Consider the fixed synthetic throttle candidate."
+}

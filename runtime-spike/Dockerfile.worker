@@ -1,0 +1,12 @@
+# Experimental synthetic worker image. Not an untrusted-code boundary.
+FROM rust:1.98.0-bookworm@sha256:82150a52ec202c1b14d7817e14516c392bb7f5cfebd88f1ed531cb37ebd39922 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY vendor/wasmi/ vendor/wasmi/
+RUN cargo build --locked --release --bin event-worker
+
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
+COPY --from=build /src/target/release/event-worker /event-worker
+USER 65534:65534
+ENTRYPOINT ["/event-worker"]

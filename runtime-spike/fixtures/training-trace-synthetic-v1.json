@@ -1,0 +1,12 @@
+{
+  "schema": "sese-synthetic-training-trace-v1",
+  "actor": "synthetic-operator",
+  "source": "operator-provided synthetic example",
+  "prompt": "How should the synthetic event be handled?",
+  "response": "Allow the synthetic event.",
+  "preference": {
+    "preferred": "Throttle the synthetic event.",
+    "rejected": "Allow the synthetic event.",
+    "source": "operator-provided synthetic comparison"
+  }
+}

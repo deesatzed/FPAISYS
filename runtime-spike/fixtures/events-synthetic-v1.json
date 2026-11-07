@@ -1,0 +1,7 @@
+{
+  "schema": "sese-synthetic-events-v1",
+  "events": [
+    { "timestamp_ns": 1, "entity_id": 42, "metric": 3.0, "flags": 4 },
+    { "timestamp_ns": 2, "entity_id": 43, "metric": 5.0, "flags": 1 }
+  ]
+}

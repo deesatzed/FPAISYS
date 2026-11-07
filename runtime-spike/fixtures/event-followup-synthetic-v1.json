@@ -1,0 +1,13 @@
+{
+  "schema": "sese-event-fixture-file-v1",
+  "version": "synthetic-followup-v1",
+  "state_semantics": "legacy-v1",
+  "cases": [
+    {
+      "id": "post-promotion",
+      "window": { "count": 1, "mean": 3.0, "p99_us": 3, "last_error": 0 },
+      "event": { "timestamp_ns": 1, "entity_id": 42, "metric": 3.0, "flags": 4 },
+      "expected": { "decision": 1, "score": 3.0, "reason": 4 }
+    }
+  ]
+}
