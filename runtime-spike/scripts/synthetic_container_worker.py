@@ -23,7 +23,8 @@ def run():
     if candidate is None:
         raise ValueError("unknown synthetic artifact")
     result = run_synthetic(image, docker_host=host, journal_dir=journal, docker=docker,
-                           candidate=candidate, event=event, window=window, timeout=float(timeout), probe_name=name)
+                           candidate=candidate, event=event, window=window, timeout=float(timeout), probe_name=name,
+                           require_worker_profile=True)
     sys.stdout.buffer.write(struct.pack("<IdI", *result["verdict"]))
 
 

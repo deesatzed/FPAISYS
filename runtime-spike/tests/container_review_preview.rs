@@ -112,6 +112,50 @@ fn window_sensitive_candidate_matches_replay_and_captured_observation() {
     let fixture = serde_json::json!({"schema":"sese-event-fixture-file-v1","version":"window-fixture","state_semantics":"measured-v2","cases":[{"id":"case","window":{"count":2,"mean":3.5,"p99_us":9,"last_error":4},"event":{"timestamp_ns":9,"entity_id":42,"metric":7.0,"flags":4},"expected":{"decision":0,"score":14.5,"reason":4}}]});
     let pack =
         sese_runtime_spike::fixture_file::parse(&serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let fixture_path = dir.join("fixture.json");
+    let run = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .args([
+                "event-container-evaluate",
+                dir.join("db").to_str().unwrap(),
+                "domain",
+                &replay.run_id.to_string(),
+                &observation.id.to_string(),
+                fixture_path.to_str().unwrap(),
+                &image,
+                &host,
+                journal.to_str().unwrap(),
+                "/opt/homebrew/bin/python3",
+                "/usr/local/bin/docker",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/synthetic_container_worker.py"
+                ),
+                "40",
+            ])
+            .output()
+            .unwrap()
+    };
+    let checkpoint = db.ledger_checkpoint().unwrap();
+    let mut wrong_fixture = fixture.clone();
+    wrong_fixture["version"] = serde_json::json!("different-version");
+    std::fs::write(&fixture_path, serde_json::to_vec(&wrong_fixture).unwrap()).unwrap();
+    let rejected = run();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("fixture does not match"));
+    assert_eq!(db.ledger_checkpoint().unwrap(), checkpoint);
+    assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+    std::fs::write(&fixture_path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+    let command = run();
+    assert!(
+        command.status.success(),
+        "{}",
+        String::from_utf8_lossy(&command.stderr)
+    );
+    let combined: serde_json::Value = serde_json::from_slice(&command.stdout).unwrap();
+    assert_eq!(combined["matched"], true);
+    assert_eq!(combined["promotion_evidence"], false);
+    assert_eq!(combined["execution_authenticated"], false);
     let replay_container = event_replay::replay_container_synthetic(
         &mut db,
         &executor,

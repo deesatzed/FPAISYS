@@ -59,6 +59,52 @@ class ContainerLifecycleTests(unittest.TestCase):
                 self.assertFalse(check(changed))
         self.assertFalse(_configuration_matches("not json", container, image, name))
 
+    def test_required_worker_profile_cannot_be_bypassed_by_entrypoint_or_arguments(self):
+        container, image, name = "a" * 64, "sha256:" + "b" * 64, "sese-synthetic-" + "c" * 32
+        report = {"Id": container, "Image": image, "Mounts": [],
+                  "State": {"Status": "created", "Running": False},
+                  "Config": {"Image": image, "User": "65534:65534", "OpenStdin": True,
+                             "Entrypoint": ["/event-worker", "--require-isolation-v1"], "Cmd": None,
+                             "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+                             "Labels": {"io.sese.synthetic-probe": name}},
+                  "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                                 "CapAdd": None, "SecurityOpt": ["no-new-privileges"], "Privileged": False,
+                                 "PidsLimit": 16, "Memory": 134217728, "MemorySwap": 134217728,
+                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None,
+                                 "Devices": None, "DeviceRequests": None, "PidMode": "", "IpcMode": "private", "UTSMode": ""}}
+        check = lambda obj: _configuration_matches(json.dumps(obj), container, image, name, require_worker_profile=True)
+        self.assertTrue(check(report))
+        for field, value in [("Entrypoint", ["/event-worker"]), ("Entrypoint", ["/bin/sh"]),
+                             ("Cmd", ["--ignore-isolation"]), ("Entrypoint", None),
+                             ("Env", ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LD_PRELOAD=/tmp/inject.so"]),
+                             ("Env", None)]:
+            changed = json.loads(json.dumps(report))
+            changed["Config"][field] = value
+            self.assertFalse(check(changed))
+            del changed["Config"][field]
+            self.assertFalse(check(changed))
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a worker image with the isolation self-check")
+    def test_required_worker_profile_runs_and_rejects_entrypoint_override_before_start(self):
+        docker = shutil.which("docker")
+        image = os.environ["SESE_TEST_CANARY_IMAGE"]
+        result = run_synthetic(image, docker=docker, journal_dir=self.journal_dir,
+                               docker_host=self.docker_host, require_worker_profile=True)
+        self.assertEqual(result["verdict"], (1, 3.0, 4))
+        marker = Path(self.journal_dir) / "worker-started"
+        wrapper = Path(self.journal_dir) / "docker-profile-wrapper"
+        for override in ("--entrypoint=/bin/sh", "--env=LD_PRELOAD=/tmp/inject.so"):
+            with self.subTest(override=override):
+                wrapper.write_text("#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\n"
+                                   + "if len(a)>2 and a[2]=='start': open(" + repr(str(marker)) + ",'w').close()\n"
+                                   + "if len(a)>2 and a[2]=='create': a.insert(-1," + repr(override) + ")\n"
+                                   + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+                wrapper.chmod(0o700)
+                with self.assertRaisesRegex(RuntimeError, "configuration unconfirmed or mismatched"):
+                    run_synthetic(image, docker=str(wrapper), journal_dir=self.journal_dir,
+                                  docker_host=self.docker_host, require_worker_profile=True)
+                self.assertFalse(marker.exists())
+
     @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a worker image with the isolation self-check")
     def test_worker_self_check_accepts_profile_and_rejects_relaxed_restrictions(self):
         docker = shutil.which("docker")

@@ -806,6 +806,9 @@ fn event_registration_records_bytes_without_execution_or_validation() {
     assert_eq!(result["executed"], false);
     assert_eq!(result["validated"], false);
     assert_eq!(result["abi"], "event-v1");
+    assert_eq!(result["structural_check"]["status"], "compatible");
+    assert_eq!(result["structural_check"]["executed"], false);
+    assert_eq!(result["structural_check"]["promotion_evidence"], false);
     let db = sese_runtime_spike::storage::Storage::open(&dbpath).unwrap();
     assert_eq!(
         db.artifact(result["candidate_id"].as_str().unwrap())
@@ -813,6 +816,34 @@ fn event_registration_records_bytes_without_execution_or_validation() {
         bytes
     );
     drop(db);
+    let trapping_start = wat::parse_str("(module (func $start unreachable) (start $start) (func (export \"evaluate_event_v1\") (param i64 f64 i64 i32 i64 i64 f64 i32) (result i32 f64 i32) i32.const 0 f64.const 0 i32.const 0))").unwrap();
+    std::fs::write(&artifact, trapping_start).unwrap();
+    let checked = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .args([
+            "event-register",
+            dbpath.to_str().unwrap(),
+            artifact.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(checked.status.success());
+    let checked: serde_json::Value = serde_json::from_slice(&checked.stdout).unwrap();
+    assert_eq!(checked["structural_check"]["status"], "compatible");
+    assert_eq!(checked["executed"], false);
+    for (name, bytes, reason) in [
+        ("malformed", b"not wasm".to_vec(), "module_parse_or_validation_failed"),
+        ("import", wat::parse_str("(module (import \"host\" \"x\" (func)) (func (export \"evaluate_event_v1\") (param i64 f64 i64 i32 i64 i64 f64 i32) (result i32 f64 i32) i32.const 0 f64.const 0 i32.const 0))").unwrap(), "forbidden_import"),
+        ("signature", wat::parse_str("(module (func (export \"evaluate_event_v1\")))").unwrap(), "wrong_event_signature"),
+    ] {
+        std::fs::write(&artifact, bytes).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_sese-outcome")).args(["event-register", dbpath.to_str().unwrap(), artifact.to_str().unwrap()]).output().unwrap();
+        assert!(output.status.success(), "{name}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["structural_check"]["status"], "incompatible", "{name}");
+        assert_eq!(report["structural_check"]["reason"], reason, "{name}");
+        assert_eq!(report["executed"], false);
+        assert_eq!(report["validated"], false);
+    }
     std::fs::write(&artifact, vec![0u8; 65_537]).unwrap();
     assert!(!Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
         .args([

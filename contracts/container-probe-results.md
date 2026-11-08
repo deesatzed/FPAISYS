@@ -1,5 +1,13 @@
 # Container isolation probe results
 
+On 2026-11-07, `runtime-spike/tests/container_worker_limits.rs` used the local
+worker image `sha256:52d3873e06a8cf862b05bcfdf556d5bf56a69e62a11183efa769c18d06d81dca`
+with the restricted profile. A fixed valid module returned the expected verdict;
+fixed modules with a host import, an infinite loop, or 1024 initial Wasm pages
+exited without a verdict. The test removed each identified container and checked
+its absence. This is a controlled worker test, not a kernel OOM test, an
+application replay/promotion test, or permission to run untrusted candidates.
+
 On 2026-11-07, a newly built synthetic worker image included a fail-closed
 in-process Linux check before reading the guest request. It checked UID/GID,
 effective capabilities, no-new-privileges, seccomp filter mode, selected cgroup

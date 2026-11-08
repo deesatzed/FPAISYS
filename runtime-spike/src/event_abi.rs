@@ -27,6 +27,49 @@ pub struct Verdict {
     pub score: f64,
     pub reason: u32,
 }
+
+/// Check the module's event export without instantiating or executing it.
+/// Compatibility here is not replay evidence, runtime validation, or authorization.
+pub fn structural_check(bytes: &[u8]) -> serde_json::Value {
+    use wasmi::{core::ValType, Config, EnforcedLimits, Engine, ExternType, Module};
+    let reason = (|| {
+        if bytes.len() > 65_536 {
+            return Some("module_too_large");
+        }
+        let mut config = Config::default();
+        config.consume_fuel(true);
+        config.enforced_limits(EnforcedLimits::strict());
+        let engine = Engine::new(&config);
+        let module = match Module::new(&engine, bytes) {
+            Ok(module) => module,
+            Err(_) => return Some("module_parse_or_validation_failed"),
+        };
+        if module.imports().next().is_some() {
+            return Some("forbidden_import");
+        }
+        let Some(ExternType::Func(func)) = module.get_export("evaluate_event_v1") else {
+            return Some("missing_event_export");
+        };
+        if func.params()
+            != [
+                ValType::I64,
+                ValType::F64,
+                ValType::I64,
+                ValType::I32,
+                ValType::I64,
+                ValType::I64,
+                ValType::F64,
+                ValType::I32,
+            ]
+            || func.results() != [ValType::I32, ValType::F64, ValType::I32]
+        {
+            return Some("wrong_event_signature");
+        }
+        None
+    })();
+    serde_json::json!({"schema":"sese-event-structure-check-v1", "status":if reason.is_some() {"incompatible"} else {"compatible"},
+        "reason":reason, "executed":false, "validated":false, "promotion_evidence":false})
+}
 /// Flattened core-Wasm signature: (u64,f64,u64,u32,u64,u64,f64,u32) -> (u32,f64,u32).
 pub fn evaluate_event(bytes: &[u8], window: &Window, event: &Event) -> Result<Verdict, String> {
     if !window.mean.is_finite() || !event.metric.is_finite() {

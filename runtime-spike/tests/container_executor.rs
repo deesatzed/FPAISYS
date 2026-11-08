@@ -662,13 +662,30 @@ fn timed_out_container_replay_retains_cleanup_identity() {
             .as_nanos()
     ));
     std::fs::create_dir(&directory).unwrap();
-    let bridge = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/scripts/synthetic_container_worker.py"
-    );
+    // The sleep image is a deliberately non-worker fault injector. Exercise the
+    // lifecycle deadline with a test-only bridge, not the application profile.
+    let helper_dir = directory.with_extension("helpers");
+    std::fs::create_dir(&helper_dir).unwrap();
+    let scripts = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts");
+    let source = std::fs::read_to_string(scripts.join("synthetic_container_worker.py")).unwrap();
+    assert!(source.contains("require_worker_profile=True"));
+    let bridge = helper_dir.join("synthetic_container_worker.py");
+    std::fs::write(
+        &bridge,
+        source.replace(
+            "require_worker_profile=True",
+            "require_worker_profile=False",
+        ),
+    )
+    .unwrap();
+    std::fs::copy(
+        scripts.join("synthetic_container_lifecycle.py"),
+        helper_dir.join("synthetic_container_lifecycle.py"),
+    )
+    .unwrap();
     let executor = SyntheticContainerExecutor::new(
         "/opt/homebrew/bin/python3",
-        bridge,
+        bridge.to_str().unwrap(),
         "/usr/local/bin/docker",
         &image,
         &host,
@@ -741,6 +758,7 @@ fn timed_out_container_replay_retains_cleanup_identity() {
     assert_eq!(record["state"], "removed");
     assert_eq!(record["result_status"], "failed");
     std::fs::remove_dir_all(directory).unwrap();
+    std::fs::remove_dir_all(helper_dir).unwrap();
 }
 
 #[test]

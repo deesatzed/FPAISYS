@@ -26,14 +26,14 @@ struct SyntheticPreferenceBundle {
     claim: JsonClaim<sese_runtime_spike::attestation::SyntheticPreferenceEvidence>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedCard {
     human: String,
     bridge: String,
     proposal: String,
 }
-#[derive(serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedEvaluation {
     schema: String,
@@ -48,6 +48,30 @@ struct PreparedEvaluation {
     checkpoint: serde_json::Value,
     preview: serde_json::Value,
     card: PreparedCard,
+}
+
+fn verify_prepared(
+    prepared: &PreparedEvaluation,
+    preview: &serde_json::Value,
+    db: &mut Storage,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if prepared.schema != "sese-prepared-synthetic-evaluation-v1"
+        || !prepared.synthetic
+        || prepared.review_recorded
+        || preview != &prepared.preview
+        || preview["checkpoint"] != prepared.checkpoint
+        || preview["replay"]["candidate_id"] != prepared.candidate_id
+        || preview["replay"]["state_semantics"] != prepared.state_semantics
+        || preview["observations"]
+            .as_array()
+            .and_then(|v| v.last())
+            .and_then(|v| v["id"].as_i64())
+            != Some(prepared.observation_id)
+        || db.current_event_champion(&prepared.domain)? != prepared.champion_id
+    {
+        return Err("prepared evaluation no longer matches current evidence".into());
+    }
+    Ok(())
 }
 
 fn read_bounded_file(path: &str, limit: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -90,7 +114,7 @@ fn decode_lower_hex<const N: usize>(text: &str) -> Result<[u8; N], &'static str>
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-propose-threshold, event-propose-from-fixture, event-proposal-inspect, event-register, event-review, event-review-preview, event-review-prepared, event-review-at, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
+        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-propose-threshold, event-propose-from-fixture, event-proposal-inspect, event-register, event-review, event-review-preview, event-review-prepared, event-review-at, event-container-evaluate, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
     }
     if args[0] == "event-init" && args.len() == 2 {
         std::fs::OpenOptions::new()
@@ -121,6 +145,115 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         Storage::from_connection(conn)?
     };
     match args[0].as_str() {
+        #[cfg(unix)]
+        "event-container-evaluate" if args.len() == 13 || args.len() == 14 => {
+            let replay_id: i64 = args[3].parse()?;
+            let observation_id: i64 = args[4].parse()?;
+            let timeout = std::time::Duration::from_secs(args[12].parse()?);
+            if timeout.is_zero() || timeout > std::time::Duration::from_secs(120) {
+                return Err("invalid container deadline".into());
+            }
+            let pack =
+                sese_runtime_spike::fixture_file::parse(&read_bounded_file(&args[5], 1_048_576)?)?;
+            let preview = db.event_review_preview(replay_id, &args[2])?;
+            let mut prepared: Option<PreparedEvaluation> = if args.len() == 14 {
+                let value = serde_json::from_slice(&read_bounded_file(&args[13], 8_388_608)?)?;
+                Some(value)
+            } else {
+                None
+            };
+            if let Some(saved) = prepared.as_ref() {
+                if saved.domain != args[2]
+                    || saved.replay_id != replay_id
+                    || saved.observation_id != observation_id
+                {
+                    return Err("prepared evaluation does not match requested review".into());
+                }
+                verify_prepared(saved, &preview, &mut db)?;
+            }
+            let original_seq = preview["checkpoint"]["seq"]
+                .as_i64()
+                .ok_or("invalid preview checkpoint")?;
+            let local = &preview["replay"];
+            if local["passed"] != true
+                || local["state_semantics"] != "measured-v2"
+                || local["fixture_version"].as_str() != Some(pack.version.as_str())
+                || local["fixture_digest"].as_str() != Some(pack.digest.as_str())
+                || pack.state_semantics != "measured-v2"
+            {
+                return Err("fixture does not match passed measured review replay".into());
+            }
+            let candidate = local["candidate_id"]
+                .as_str()
+                .ok_or("invalid replay candidate")?;
+            let observations = preview["observations"]
+                .as_array()
+                .ok_or("invalid review observations")?;
+            let observation = observations
+                .iter()
+                .find(|o| o["id"].as_i64() == Some(observation_id))
+                .ok_or("observation not found in review")?;
+            if observation["shadow_id"].as_str() != Some(candidate)
+                || !observation["champion_error"].is_null()
+                || !observation["shadow_error"].is_null()
+                || observation["champion_id"].as_str()
+                    != Some(db.current_event_champion(&args[2])?.as_str())
+            {
+                return Err("observation does not match current review".into());
+            }
+            let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
+                &args[9], &args[11], &args[10], &args[6], &args[7], &args[8],
+            )?;
+            let container_replay = sese_runtime_spike::event_replay::replay_container_synthetic(
+                &mut db, &executor, candidate, &pack, timeout,
+            )?;
+            if !container_replay.passed {
+                return Err(format!(
+                    "container replay failed; container_replay_seq={}",
+                    container_replay.seq
+                )
+                .into());
+            }
+            let comparison = sese_runtime_spike::event_host::compare_container_observation(
+                &mut db,
+                &executor,
+                &args[2],
+                observation_id,
+                timeout,
+            )
+            .map_err(|error| format!("{error}; container_replay_seq={}", container_replay.seq))?;
+            let mut combined = db
+                .event_container_review_preview(
+                    &args[2],
+                    replay_id,
+                    observation_id,
+                    container_replay.seq,
+                    comparison.seq,
+                )
+                .map_err(|error| {
+                    format!(
+                        "{error}; container_replay_seq={}; container_observation_seq={}",
+                        container_replay.seq, comparison.seq
+                    )
+                })?;
+            if let Some(saved) = prepared.as_mut() {
+                let mut original_review = preview.clone();
+                let mut updated_review = combined["review"].clone();
+                original_review["checkpoint"] = serde_json::Value::Null;
+                updated_review["checkpoint"] = serde_json::Value::Null;
+                if original_seq.checked_add(1) != Some(container_replay.seq)
+                    || original_seq.checked_add(2) != Some(comparison.seq)
+                    || combined["checkpoint"]["seq"].as_i64() != Some(comparison.seq)
+                    || original_review != updated_review
+                {
+                    return Err(format!("review changed during container evaluation; container_replay_seq={}; container_observation_seq={}", container_replay.seq, comparison.seq).into());
+                }
+                saved.preview = combined["review"].clone();
+                saved.checkpoint = combined["checkpoint"].clone();
+                combined["prepared"] = serde_json::to_value(saved)?;
+            }
+            println!("{combined}");
+        }
         #[cfg(unix)]
         "event-container-observation" if args.len() == 11 => {
             let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
@@ -460,15 +593,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "window-register" | "event-register" if args.len() == 3 => {
             let bytes = read_bounded_file(&args[2], 65_536)?;
+            let structural_check = if args[0] == "event-register" {
+                Some(sese_runtime_spike::event_abi::structural_check(&bytes))
+            } else {
+                None
+            };
             let (id, abi) = if args[0] == "event-register" {
                 (db.register_event(&bytes)?, "event-v1")
             } else {
                 (db.register_window(&bytes)?, "window-v1")
             };
-            println!(
-                "{}",
-                serde_json::json!({"candidate_id":id,"abi":abi,"executed":false,"validated":false})
-            );
+            let mut output =
+                serde_json::json!({"candidate_id":id,"abi":abi,"executed":false,"validated":false});
+            if let Some(check) = structural_check {
+                output["structural_check"] = check;
+            }
+            println!("{output}");
         }
         "window-bootstrap" if args.len() == 5 => {
             db.bootstrap_champion(&args[2], &args[3], &args[4])?;
@@ -970,29 +1110,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", db.event_review_preview(args[3].parse()?, &args[2])?)
         }
         "event-review-prepared" if args.len() == 5 => {
-            let prepared: PreparedEvaluation =
+            let mut source: serde_json::Value =
                 serde_json::from_slice(&read_bounded_file(&args[2], 8_388_608)?)?;
-            if prepared.schema != "sese-prepared-synthetic-evaluation-v1"
-                || !prepared.synthetic
-                || prepared.review_recorded
-                || !["approve", "reject"].contains(&args[4].as_str())
-            {
-                return Err("invalid prepared evaluation or decision".into());
+            if source["schema"] == "sese-container-review-preview-v1" {
+                source = source
+                    .get_mut("prepared")
+                    .ok_or("comparison lacks prepared evaluation")?
+                    .take();
+            }
+            let prepared: PreparedEvaluation = serde_json::from_value(source)?;
+            if !["approve", "reject"].contains(&args[4].as_str()) {
+                return Err("invalid decision".into());
             }
             let preview = db.event_review_preview(prepared.replay_id, &prepared.domain)?;
-            if preview != prepared.preview
-                || preview["checkpoint"] != prepared.checkpoint
-                || preview["replay"]["candidate_id"] != prepared.candidate_id
-                || preview["replay"]["state_semantics"] != prepared.state_semantics
-                || preview["observations"]
-                    .as_array()
-                    .and_then(|v| v.last())
-                    .and_then(|v| v["id"].as_i64())
-                    != Some(prepared.observation_id)
-                || db.current_event_champion(&prepared.domain)? != prepared.champion_id
-            {
-                return Err("prepared evaluation no longer matches current evidence".into());
-            }
+            verify_prepared(&prepared, &preview, &mut db)?;
             let seq = prepared.checkpoint["seq"]
                 .as_i64()
                 .ok_or("invalid prepared checkpoint")?;

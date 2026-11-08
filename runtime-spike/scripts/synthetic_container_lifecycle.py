@@ -455,7 +455,7 @@ def _check_journal(directory_fd):
             raise RuntimeError(f"unresolved synthetic container receipt: {filename}") from exc
 
 
-def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None):
+def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
     """Serialize cooperating runs in one journal; unresolved receipts prevent launch."""
     if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
@@ -481,12 +481,12 @@ def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", even
                     raise RuntimeError("journal lock deadline exceeded")
                 time.sleep(min(0.02, remaining))
         _check_journal(directory_fd)
-        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name)
+        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name, require_worker_profile=require_worker_profile)
     finally:
         os.close(directory_fd)
 
 
-def _configuration_matches(output, container_id, image, name):
+def _configuration_matches(output, container_id, image, name, *, require_worker_profile=False):
     """Check reported pre-start settings; Docker and its report remain unauthenticated."""
     try:
         obj = json.loads(output)
@@ -494,6 +494,9 @@ def _configuration_matches(output, container_id, image, name):
         return (obj["Id"] == container_id and obj["Image"] == image
                 and obj["Mounts"] == [] and state["Status"] == "created" and state["Running"] is False
                 and config["Image"] == image and config["User"] == "65534:65534"
+                and (not require_worker_profile or (config["Entrypoint"] == ["/event-worker", "--require-isolation-v1"]
+                     and config["Cmd"] in (None, [])
+                     and config["Env"] == ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]))
                 and config["OpenStdin"] is True and config["Labels"].get("io.sese.synthetic-probe") == name
                 and host["NetworkMode"] == "none" and host["ReadonlyRootfs"] is True
                 and host["CapDrop"] == ["ALL"] and host["CapAdd"] in (None, [])
@@ -508,7 +511,7 @@ def _configuration_matches(output, container_id, image, name):
         return False
 
 
-def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), docker="docker", intent_callback=None, probe_name=None):
+def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
     """Run a built-in synthetic candidate; return only after verified cleanup."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
@@ -559,7 +562,7 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
             raise RuntimeError("container creation unconfirmed")
         container_id = created
         report = _docker_read([docker, "--host", host, "inspect", "--type", "container", "--format", "{{json .}}", container_id], limit=65536, deadline=deadline)
-        if report is None or not _configuration_matches(report, container_id, image, name) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
+        if report is None or not _configuration_matches(report, container_id, image, name, require_worker_profile=require_worker_profile) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
             raise RuntimeError("container configuration unconfirmed or mismatched")
         if time.monotonic() >= deadline:
             raise RuntimeError("container deadline exceeded")

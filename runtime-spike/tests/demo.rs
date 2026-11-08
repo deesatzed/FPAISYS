@@ -2,6 +2,110 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step() {
+    let image = match std::env::var("SESE_TEST_IMAGE") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let host = std::env::var("SESE_TEST_DOCKER_HOST").unwrap();
+    let dir = std::env::temp_dir().join(format!(
+        "sese-prepared-container-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("app.db");
+    let journal = dir.join("journal");
+    std::fs::create_dir(&journal).unwrap();
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/event-measured-synthetic-v1.json"
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db)
+        .args(["--measured", "--prepare-only", "--fixture", fixture])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let prepared = dir.join("prepared.json");
+    std::fs::write(&prepared, &output.stdout).unwrap();
+    let run_comparison = || {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .args([
+                "event-container-evaluate",
+                db.to_str().unwrap(),
+                "typed-cycle",
+                &snapshot["replay_id"].as_i64().unwrap().to_string(),
+                &snapshot["observation_id"].as_i64().unwrap().to_string(),
+                fixture,
+                &image,
+                &host,
+                journal.to_str().unwrap(),
+                "/opt/homebrew/bin/python3",
+                "/usr/local/bin/docker",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/synthetic_container_worker.py"
+                ),
+                "40",
+                prepared.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+    };
+    let mut stale = snapshot.clone();
+    stale["checkpoint"]["hash"] = serde_json::json!("0".repeat(64));
+    std::fs::write(&prepared, serde_json::to_vec(&stale).unwrap()).unwrap();
+    let rejected = run_comparison();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("no longer matches"));
+    assert_eq!(std::fs::read_dir(&journal).unwrap().count(), 0);
+    std::fs::write(&prepared, &output.stdout).unwrap();
+    let result = run_comparison();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let combined: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(combined["promotion_evidence"], false);
+    assert_eq!(combined["prepared"]["checkpoint"], combined["checkpoint"]);
+    let fresh = dir.join("comparison.json");
+    std::fs::write(&fresh, result.stdout).unwrap();
+    let decide = |file: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .args([
+                "event-review-prepared",
+                db.to_str().unwrap(),
+                file.to_str().unwrap(),
+                "operator",
+                "reject",
+            ])
+            .output()
+            .unwrap()
+    };
+    assert!(!decide(&prepared).status.success());
+    let decision = decide(&fresh);
+    assert!(
+        decision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision.stderr)
+    );
+    let decision: serde_json::Value = serde_json::from_slice(&decision.stdout).unwrap();
+    assert_eq!(decision["promoted"], false);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn prepared_approval_rolls_back_review_if_promotion_write_fails() {
     let dir = std::env::temp_dir().join(format!(
         "sese-atomic-review-{}-{}",
