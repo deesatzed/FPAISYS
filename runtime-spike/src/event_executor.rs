@@ -259,7 +259,9 @@ impl SyntheticContainerExecutor {
             &self.python.path,
             &args,
             request.clone(),
-            timeout,
+            // Let the bridge finish its bounded cleanup after the evaluation
+            // deadline. This remains best effort if Docker or the host fails.
+            timeout + Duration::from_secs(30),
             16,
         )
         .map_err(|e| format!("{e}; receipt_path={}", path.display()))?;

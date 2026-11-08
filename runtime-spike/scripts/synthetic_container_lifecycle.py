@@ -70,14 +70,17 @@ def _validate_host(host):
     return host
 
 
-def _docker_read(args, *, limit=4096):
+def _docker_read(args, *, limit=4096, deadline=None):
     """Read a bounded Docker response; failures and deadlines are unknown."""
+    now = time.monotonic()
+    deadline = min(now + 5, deadline) if deadline is not None else now + 5
+    if now >= deadline:
+        return None
     try:
         proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())
     except OSError:
         return None
     output = bytearray()
-    deadline = time.monotonic() + 5
     try:
         os.set_blocking(proc.stdout.fileno(), False)
         with selectors.DefaultSelector() as selector:
@@ -120,15 +123,15 @@ def _docker_read(args, *, limit=4096):
         proc.stdout.close()
 
 
-def _daemon_id(docker, host):
-    value = _docker_read([docker, "--host", host, "info", "--format", "{{.ID}}"], limit=128)
+def _daemon_id(docker, host, *, deadline=None):
+    value = _docker_read([docker, "--host", host, "info", "--format", "{{.ID}}"], limit=128, deadline=deadline)
     if value is None or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,128}", value):
         return None
     return value
 
 
 def inspect_pending(receipt_path, *, docker="docker"):
-    """Read a pending record and inspect Docker without changing either."""
+    """Inspect a preflight or pending record without changing it or Docker."""
     path = Path(receipt_path)
     if not hasattr(os, "O_NOFOLLOW"):
         raise OSError("safe receipt opening is unavailable")
@@ -158,26 +161,32 @@ def inspect_pending(receipt_path, *, docker="docker"):
     version = record.get("schema")
     legacy = version in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2")
     expected_fields = {"schema", "name", "image", "state"}
-    if version in ("sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4"):
+    if version in ("sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
         expected_fields.add("daemon_id")
-    if version in ("sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4"):
+    if version in ("sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
         expected_fields.add("docker_host")
-    if version == "sese-synthetic-container-intent-v4":
+    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
         expected_fields.update(("candidate", "artifact_sha256", "request_sha256"))
     if set(record) != expected_fields:
         raise ValueError("invalid pending receipt fields")
     name, image = record["name"], record["image"]
-    if (version not in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4") or record["state"] != "pending"
+    if (version not in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1") or record["state"] != ("not_created" if version == "sese-synthetic-container-preflight-v1" else "pending")
             or not isinstance(name, str) or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", name)
             or path.name != name + ".json" or not isinstance(image, str)
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", image)):
         raise ValueError("invalid pending receipt")
-    if version == "sese-synthetic-container-intent-v4":
+    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
         _, artifact = _synthetic_request(record["candidate"], (1, 42, 3.0, 4), (0, 0.0, 0, 0))
         if (record["artifact_sha256"] != hashlib.sha256(artifact).hexdigest()
                 or not isinstance(record["request_sha256"], str)
                 or not re.fullmatch(r"[0-9a-f]{64}", record["request_sha256"])):
             raise ValueError("invalid synthetic request identity")
+    if version == "sese-synthetic-container-preflight-v1":
+        _validate_host(record["docker_host"])
+        if record["daemon_id"] is not None:
+            raise ValueError("invalid preflight receipt")
+        return {"status": "not_created", "name": name, "image": image,
+                "receipt_sha256": hashlib.sha256(payload).hexdigest(), "docker_host": record["docker_host"]}
     unknown = {"status": "unknown", "name": name, "image": image,
                "receipt_sha256": hashlib.sha256(payload).hexdigest(), "docker_host": record.get("docker_host")}
     if legacy or record["daemon_id"] is None:
@@ -415,6 +424,18 @@ def _check_journal(directory_fd):
             if len(raw) > 4096:
                 raise ValueError("oversized receipt")
             receipt = json.loads(raw, object_pairs_hook=unique_pairs)
+            preflight_fields = {"schema", "name", "image", "state", "daemon_id", "docker_host", "candidate", "artifact_sha256", "request_sha256"}
+            if isinstance(receipt, dict) and receipt.get("schema") == "sese-synthetic-container-preflight-v1":
+                if (set(receipt) != preflight_fields or receipt["state"] != "not_created" or receipt["daemon_id"] is not None
+                        or receipt["name"] + ".json" != filename or not isinstance(receipt["image"], str)
+                        or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["image"])
+                        or not isinstance(receipt["request_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", receipt["request_sha256"])):
+                    raise ValueError("invalid preflight receipt")
+                _validate_host(receipt["docker_host"])
+                _, artifact = _synthetic_request(receipt["candidate"], (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+                if receipt["artifact_sha256"] != hashlib.sha256(artifact).hexdigest():
+                    raise ValueError("invalid preflight artifact")
+                continue
             fields = {"schema", "name", "image", "state", "daemon_id", "docker_host", "candidate", "artifact_sha256", "request_sha256", "container_id", "result_status", "output_sha256"}
             if not isinstance(receipt, dict) or set(receipt) != fields or receipt["schema"] != "sese-synthetic-container-intent-v4" or receipt["state"] != "removed" or receipt["name"] + ".json" != filename:
                 raise ValueError("receipt not confirmed removed")
@@ -460,17 +481,37 @@ def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", even
                     raise RuntimeError("journal lock deadline exceeded")
                 time.sleep(min(0.02, remaining))
         _check_journal(directory_fd)
-        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, timeout=timeout, docker=docker, intent_callback=intent_callback, probe_name=probe_name)
+        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name)
     finally:
         os.close(directory_fd)
 
 
-def _run_synthetic_locked(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None):
+def _configuration_matches(output, container_id, image, name):
+    """Check reported pre-start settings; Docker and its report remain unauthenticated."""
+    try:
+        obj = json.loads(output)
+        host, config, state = obj["HostConfig"], obj["Config"], obj["State"]
+        return (obj["Id"] == container_id and obj["Image"] == image
+                and obj["Mounts"] == [] and state["Status"] == "created" and state["Running"] is False
+                and config["Image"] == image and config["User"] == "65534:65534"
+                and config["OpenStdin"] is True and config["Labels"].get("io.sese.synthetic-probe") == name
+                and host["NetworkMode"] == "none" and host["ReadonlyRootfs"] is True
+                and host["CapDrop"] == ["ALL"] and host["CapAdd"] in (None, [])
+                and host["SecurityOpt"] == ["no-new-privileges"] and host["Privileged"] is False
+                and host["PidsLimit"] == 16 and host["Memory"] == 134217728
+                and host["MemorySwap"] == 134217728 and host["NanoCpus"] == 1000000000
+                and host["Binds"] in (None, []) and host["VolumesFrom"] in (None, [])
+                and host["Devices"] in (None, []) and host["DeviceRequests"] in (None, [])
+                and host["PidMode"] in ("", "private") and host["IpcMode"] in ("", "private")
+                and host["UTSMode"] in ("", "private"))
+    except (TypeError, KeyError, ValueError, AttributeError):
+        return False
+
+
+def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), docker="docker", intent_callback=None, probe_name=None):
     """Run a built-in synthetic candidate; return only after verified cleanup."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
-    if not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
-        raise ValueError("timeout must be between zero and 60 seconds")
     host = _validate_host(docker_host)
     request, artifact = _synthetic_request(candidate, event, window)
     if probe_name is not None and (not isinstance(probe_name, str) or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", probe_name)):
@@ -480,101 +521,103 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, candidate="throttl
     if not directory_path.is_dir():
         raise ValueError("journal directory must exist")
     receipt_path = directory_path / (name + ".json")
-    receipt = {"schema": "sese-synthetic-container-intent-v4", "name": name, "image": image, "state": "pending", "daemon_id": None, "docker_host": host,
+    receipt = {"schema": "sese-synthetic-container-preflight-v1", "name": name, "image": image, "state": "not_created", "daemon_id": None, "docker_host": host,
                "candidate": candidate, "artifact_sha256": hashlib.sha256(artifact).hexdigest(), "request_sha256": hashlib.sha256(request).hexdigest()}
     _write_receipt(receipt_path, receipt, create=True)
     if intent_callback is not None:
         intent_callback(str(receipt_path))
-    daemon_id = _daemon_id(docker, host)
+    daemon_id = _daemon_id(docker, host, deadline=deadline)
     if daemon_id is None:
         raise RuntimeError(f"Docker daemon identity unconfirmed; receipt_path={receipt_path}")
-    receipt["daemon_id"] = daemon_id
-    _write_receipt(receipt_path, receipt, create=False)
-    volumes = _docker_read([docker, "--host", host, "image", "inspect", "--format", "{{json .Config.Volumes}}", image])
+    volumes = _docker_read([docker, "--host", host, "image", "inspect", "--format", "{{json .Config.Volumes}}", image], deadline=deadline)
     try:
         declared_volumes = json.loads(volumes) if volumes is not None else None
     except json.JSONDecodeError:
         declared_volumes = None
     if volumes is None or declared_volumes not in (None, {}) or volumes not in ("null", "{}"):
         raise RuntimeError(f"image declares volumes or volume configuration unconfirmed; receipt_path={receipt_path}")
-    if _daemon_id(docker, host) != daemon_id:
+    if _daemon_id(docker, host, deadline=deadline) != daemon_id:
         raise RuntimeError(f"Docker daemon changed before launch; receipt_path={receipt_path}")
+    receipt.update(schema="sese-synthetic-container-intent-v4", state="pending", daemon_id=daemon_id)
+    _write_receipt(receipt_path, receipt, create=False)
     container_id = None
     output = bytearray()
     error = None
     proc = None
     cleanup_verified = False
-    with tempfile.TemporaryDirectory(prefix="sese-container-") as directory:
-        cidfile = Path(directory) / "cid"
-        args = [
-            docker, "--host", host, "run", "--pull=never", "--interactive", "--name", name,
-            "--label", "io.sese.synthetic-probe=" + name, "--cidfile", str(cidfile),
-            "--network=none", "--read-only", "--cap-drop=ALL",
-            "--security-opt=no-new-privileges", "--pids-limit=16",
-            "--memory=128m", "--memory-swap=128m", "--cpus=1",
-            "--user=65534:65534", image,
-        ]
-        try:
-            proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())
-            proc.stdin.write(request)
-            proc.stdin.close()
-            os.set_blocking(proc.stdout.fileno(), False)
-            deadline = time.monotonic() + timeout
-            with selectors.DefaultSelector() as selector:
-                selector.register(proc.stdout, selectors.EVENT_READ)
-                eof = False
-                while not (eof and proc.poll() is not None):
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise RuntimeError("container deadline exceeded")
-                    if not eof:
-                        for key, _ in selector.select(min(remaining, 0.05)):
-                            chunk = os.read(key.fd, 17 - len(output))
-                            if not chunk:
-                                selector.unregister(proc.stdout)
-                                eof = True
-                                break
-                            output.extend(chunk)
-                            if len(output) > 16:
-                                raise RuntimeError("container response exceeds 16 bytes")
-                    else:
-                        time.sleep(min(remaining, 0.01))
-            if proc.returncode != 0:
-                raise RuntimeError("container worker failed")
-            if len(output) != 16:
-                raise RuntimeError("invalid container response length")
-            verdict = struct.unpack("<IdI", output)
-            if verdict[0] not in (0, 1, 2, 3) or not math.isfinite(verdict[1]):
-                raise RuntimeError("invalid synthetic verdict")
-        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            error = str(exc)
-        finally:
-            if proc is not None and proc.poll() is None:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    error = "Docker client termination unconfirmed"
-            if proc is not None and proc.stdout is not None:
-                proc.stdout.close()
-            if cidfile.exists():
-                cid_text = cidfile.read_text().strip()
-                if re.fullmatch(r"[0-9a-f]{64}", cid_text):
-                    container_id = cid_text
-            if container_id is None:
-                error = f"container creation or cleanup unconfirmed; probe name {name}"
-            elif _daemon_id(docker, host) != daemon_id:
-                error = f"Docker daemon changed; container cleanup unconfirmed: {container_id}"
-            else:
-                try:
-                    removal = subprocess.run([docker, "--host", host, "rm", "-f", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, env=_docker_env())
-                    remaining = subprocess.run([docker, "--host", host, "ps", "-aq", "--no-trunc", "--filter", "id=" + container_id], capture_output=True, text=True, timeout=5, env=_docker_env())
-                    if removal.returncode != 0 or remaining.returncode != 0 or remaining.stdout.strip() or _daemon_id(docker, host) != daemon_id:
-                        error = f"container cleanup unconfirmed: {container_id}"
-                    else:
-                        cleanup_verified = True
-                except (OSError, subprocess.SubprocessError):
+    args = [
+        docker, "--host", host, "create", "--pull=never", "--interactive", "--name", name,
+        "--label", "io.sese.synthetic-probe=" + name,
+        "--network=none", "--read-only", "--cap-drop=ALL",
+        "--security-opt=no-new-privileges", "--pids-limit=16",
+        "--memory=128m", "--memory-swap=128m", "--cpus=1",
+        "--user=65534:65534", image,
+    ]
+    try:
+        created = _docker_read(args, limit=256, deadline=deadline)
+        if created is None or not re.fullmatch(r"[0-9a-f]{64}", created):
+            raise RuntimeError("container creation unconfirmed")
+        container_id = created
+        report = _docker_read([docker, "--host", host, "inspect", "--type", "container", "--format", "{{json .}}", container_id], limit=65536, deadline=deadline)
+        if report is None or not _configuration_matches(report, container_id, image, name) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
+            raise RuntimeError("container configuration unconfirmed or mismatched")
+        if time.monotonic() >= deadline:
+            raise RuntimeError("container deadline exceeded")
+        proc = subprocess.Popen([docker, "--host", host, "start", "--attach", "--interactive", container_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())
+        proc.stdin.write(request)
+        proc.stdin.close()
+        os.set_blocking(proc.stdout.fileno(), False)
+        with selectors.DefaultSelector() as selector:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+            eof = False
+            while not (eof and proc.poll() is not None):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("container deadline exceeded")
+                if not eof:
+                    for key, _ in selector.select(min(remaining, 0.05)):
+                        chunk = os.read(key.fd, 17 - len(output))
+                        if not chunk:
+                            selector.unregister(proc.stdout)
+                            eof = True
+                            break
+                        output.extend(chunk)
+                        if len(output) > 16:
+                            raise RuntimeError("container response exceeds 16 bytes")
+                else:
+                    time.sleep(min(remaining, 0.01))
+        if proc.returncode != 0:
+            raise RuntimeError("container worker failed")
+        if len(output) != 16:
+            raise RuntimeError("invalid container response length")
+        verdict = struct.unpack("<IdI", output)
+        if verdict[0] not in (0, 1, 2, 3) or not math.isfinite(verdict[1]):
+            raise RuntimeError("invalid synthetic verdict")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        error = str(exc)
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                error = "Docker client termination unconfirmed"
+        if proc is not None and proc.stdout is not None:
+            proc.stdout.close()
+        if container_id is None:
+            error = f"container creation or cleanup unconfirmed; probe name {name}"
+        elif _daemon_id(docker, host) != daemon_id:
+            error = f"Docker daemon changed; container cleanup unconfirmed: {container_id}"
+        else:
+            try:
+                removal = subprocess.run([docker, "--host", host, "rm", "-f", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, env=_docker_env())
+                remaining = subprocess.run([docker, "--host", host, "ps", "-aq", "--no-trunc", "--filter", "id=" + container_id], capture_output=True, text=True, timeout=5, env=_docker_env())
+                if removal.returncode != 0 or remaining.returncode != 0 or remaining.stdout.strip() or _daemon_id(docker, host) != daemon_id:
                     error = f"container cleanup unconfirmed: {container_id}"
+                else:
+                    cleanup_verified = True
+            except (OSError, subprocess.SubprocessError):
+                error = f"container cleanup unconfirmed: {container_id}"
     if cleanup_verified:
         receipt.update(state="removed", container_id=container_id,
                        result_status="valid_verdict" if error is None else "failed",

@@ -589,7 +589,7 @@ fn changed_ledger_rejects_historical_container_experiment() {
     let release = dir.join("release");
     let wrapper = dir.join("docker-wrapper");
     let quote = |p: &std::path::Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
-    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = run ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
+    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = start ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let executor = SyntheticContainerExecutor::new(
         "/opt/homebrew/bin/python3",
@@ -956,7 +956,7 @@ fn operator_can_compare_stored_container_evidence_in_a_read_only_snapshot() {
     let marker = dir.join("first-run");
     let wrapper = dir.join("failing-docker");
     let marker_quoted = format!("'{}'", marker.to_str().unwrap().replace('\'', "'\\''"));
-    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = run ]; then if [ -e {marker_quoted} ]; then exit 1; fi; : > {marker_quoted}; fi\nexec /usr/local/bin/docker \"$@\"\n")).unwrap();
+    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = start ]; then if [ -e {marker_quoted} ]; then exit 1; fi; : > {marker_quoted}; fi\nexec /usr/local/bin/docker \"$@\"\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let failure_executor = SyntheticContainerExecutor::new(
         "/opt/homebrew/bin/python3",

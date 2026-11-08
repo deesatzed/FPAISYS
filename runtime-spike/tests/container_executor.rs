@@ -677,10 +677,13 @@ fn timed_out_container_replay_retains_cleanup_identity() {
     .unwrap();
     let (event, window) = request();
     let artifact = sese_runtime_spike::builtin_event::artifact("throttle").unwrap();
+    let started = std::time::Instant::now();
     let error = match executor.execute(&artifact, &window, &event, Duration::from_secs(5)) {
         Ok(_) => panic!("sleep worker returned a verdict"),
         Err(error) => error,
     };
+    assert!(started.elapsed() >= Duration::from_secs(4));
+    assert!(started.elapsed() < Duration::from_secs(30));
     let receipt = std::path::PathBuf::from(
         error
             .split("receipt_path=")
@@ -702,7 +705,8 @@ fn timed_out_container_replay_retains_cleanup_identity() {
         ])
         .output()
         .unwrap();
-    if inspected.status.success() {
+    let container_remained = inspected.status.success();
+    if container_remained {
         let text = String::from_utf8(inspected.stdout).unwrap();
         let fields: Vec<_> = text.trim().split('|').collect();
         assert_eq!(fields.len(), 3);
@@ -732,8 +736,10 @@ fn timed_out_container_replay_retains_cleanup_identity() {
         assert!(remaining.status.success());
         assert!(remaining.stdout.is_empty());
     }
-    assert!(error.contains("deadline exceeded"), "{error}");
-    assert_eq!(record["state"], "pending");
+    assert!(error.contains("worker failed"), "{error}");
+    assert!(!container_remained, "timeout left a test container behind");
+    assert_eq!(record["state"], "removed");
+    assert_eq!(record["result_status"], "failed");
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -761,7 +767,7 @@ fn container_replay_rejects_a_changed_ledger_snapshot() {
     let release = dir.join("release");
     let wrapper = dir.join("docker-wrapper");
     let quote = |p: &std::path::Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
-    let script = format!("#!/bin/sh\nif [ \"$3\" = run ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n", quote(&marker), quote(&release));
+    let script = format!("#!/bin/sh\nif [ \"$3\" = start ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n", quote(&marker), quote(&release));
     std::fs::write(&wrapper, script).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut db = sese_runtime_spike::storage::Storage::open(&db_path).unwrap();

@@ -2,6 +2,11 @@
 use sese_runtime_spike::event_abi::{evaluate_event, Decision, Event, Window};
 use std::io::{Read, Write};
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => (),
+        [arg] if arg == "--require-isolation-v1" => sese_runtime_spike::isolation_canary::verify()?,
+        _ => return Err("invalid worker arguments".into()),
+    }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     sese_runtime_spike::worker_limits::apply()?;
     let mut data = Vec::new();

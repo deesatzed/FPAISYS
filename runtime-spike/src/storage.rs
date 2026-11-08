@@ -642,6 +642,105 @@ impl Storage {
         }
         Ok(id)
     }
+    /// Store an unexecuted fixture-derived proposal and its exact source atomically.
+    pub fn record_fixture_proposal(&mut self, fixture: &[u8]) -> Result<serde_json::Value, String> {
+        let pack = crate::fixture_file::parse(fixture)?;
+        let threshold = crate::proposal::threshold_from_fixture(&pack)?;
+        let artifact = crate::proposal::threshold_artifact(threshold)?;
+        let id = digest(&artifact);
+        let record = crate::proposal::FixtureProposalRecord {
+            schema: "sese-fixture-threshold-proposal-record-v1".into(),
+            generator: "local-threshold-fit-v1".into(),
+            candidate_id: id.clone(),
+            threshold_bits: format!("{:016x}", threshold.to_bits()),
+            fixture_version: pack.version.clone(),
+            fixture_digest: pack.digest.clone(),
+            fixture_raw_sha256: digest(fixture),
+            fixture_json: std::str::from_utf8(fixture)
+                .map_err(|e| e.to_string())?
+                .into(),
+            training_cases: pack.cases.len(),
+        };
+        let payload = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+            .to_string();
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        if !crate::ledger::verify_storage(&tx)? {
+            return Err("ledger integrity failure".into());
+        }
+        tx.execute("INSERT OR IGNORE INTO candidates(id,artifact,runtime,abi_version) VALUES (?1,?2,'wasmi-experimental',3)", params![id,artifact]).map_err(|e|e.to_string())?;
+        let (stored, runtime, abi): (Vec<u8>, String, i64) = tx
+            .query_row(
+                "SELECT artifact,runtime,abi_version FROM candidates WHERE id=?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if stored != artifact || runtime != "wasmi-experimental" || abi != 3 {
+            return Err("candidate identity or ABI mismatch".into());
+        }
+        let seq = crate::ledger::append_event_proposal(&tx, &payload, &now)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(
+            serde_json::json!({"schema":"sese-fixture-threshold-proposal-v1", "proposal_seq":seq, "candidate_id":id,
+            "threshold":threshold, "training_fixture_version":pack.version, "training_fixture_digest":pack.digest,
+            "training_cases":pack.cases.len(), "generator":"local-threshold-fit-v1", "static_rule_fits_training":true,
+            "executed":false, "validated":false, "classification":"not asserted by this command"}),
+        )
+    }
+
+    /// Recompute a stored proposal from its exact recorded source in a verified snapshot.
+    pub fn inspect_fixture_proposal(&mut self, seq: i64) -> Result<serde_json::Value, String> {
+        if seq <= 0 {
+            return Err("invalid proposal sequence".into());
+        }
+        let tx = self.conn.transaction().map_err(|e| e.to_string())?;
+        if !crate::ledger::verify_storage(&tx)? {
+            return Err("ledger integrity failure".into());
+        }
+        let payload: String = tx.query_row("SELECT payload FROM ledger_events WHERE seq=?1 AND kind='event_proposal' AND reference=0", [seq], |r|r.get(0)).map_err(|e|e.to_string())?;
+        let record: crate::proposal::FixtureProposalRecord =
+            serde_json::from_str(&payload).map_err(|e| e.to_string())?;
+        let pack = crate::fixture_file::parse(record.fixture_json.as_bytes())?;
+        let threshold = crate::proposal::threshold_from_fixture(&pack)?;
+        let artifact = crate::proposal::threshold_artifact(threshold)?;
+        let (stored, runtime, abi): (Vec<u8>, String, i64) = tx
+            .query_row(
+                "SELECT artifact,runtime,abi_version FROM candidates WHERE id=?1",
+                [&record.candidate_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| e.to_string())?;
+        if record.schema != "sese-fixture-threshold-proposal-record-v1"
+            || record.generator != "local-threshold-fit-v1"
+            || record.fixture_raw_sha256 != digest(record.fixture_json.as_bytes())
+            || record.fixture_version != pack.version
+            || record.fixture_digest != pack.digest
+            || record.training_cases != pack.cases.len()
+            || record.threshold_bits != format!("{:016x}", threshold.to_bits())
+            || record.candidate_id != digest(&artifact)
+            || stored != artifact
+            || runtime != "wasmi-experimental"
+            || abi != 3
+        {
+            return Err("proposal evidence mismatch".into());
+        }
+        let source: serde_json::Value =
+            serde_json::from_str(&record.fixture_json).map_err(|e| e.to_string())?;
+        let output = serde_json::json!({"schema":"sese-fixture-threshold-proposal-inspection-v1","proposal_seq":seq,
+            "candidate_id":record.candidate_id,"threshold":threshold,"training_fixture_version":pack.version,
+            "training_fixture_digest":pack.digest,"training_fixture_raw_sha256":record.fixture_raw_sha256,
+            "training_fixture":source,"training_fixture_json":record.fixture_json,"training_cases":pack.cases.len(),"generator":record.generator,
+            "static_rule_fits_training":true,"executed":false,"validated":false});
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(output)
+    }
     /// Caller asserts these are fixed synthetic test bytes; this is not a sandbox or attestation.
     pub fn register_synthetic_event(&self, artifact: &[u8]) -> Result<String, String> {
         if artifact.is_empty() || artifact.len() > 65_536 {
@@ -1274,6 +1373,82 @@ impl Storage {
         checkpoint: Option<(i64, &str)>,
         preview_domain: Option<&str>,
     ) -> Result<i64, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let id = Self::record_event_review_tx(
+            &tx,
+            candidate,
+            replay,
+            observation,
+            actor,
+            action,
+            human,
+            bridge,
+            proposal,
+            checkpoint,
+            preview_domain,
+        )?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    /// Atomically record a prepared synthetic decision and, if approved, promote it.
+    pub fn decide_prepared_event(
+        &mut self,
+        domain: &str,
+        expected_champion: &str,
+        candidate: &str,
+        replay: i64,
+        observation: i64,
+        actor: &str,
+        action: &str,
+        human: &str,
+        bridge: &str,
+        proposal: &str,
+        checkpoint: (i64, &str),
+    ) -> Result<i64, String> {
+        if domain.trim().is_empty() || domain.len() > 16_384 {
+            return Err("invalid preview domain".into());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let id = Self::record_event_review_tx(
+            &tx,
+            candidate,
+            replay,
+            observation,
+            actor,
+            action,
+            human,
+            bridge,
+            proposal,
+            Some(checkpoint),
+            Some(domain),
+        )?;
+        if action == "approve" {
+            Self::promote_event_tx(&tx, domain, expected_champion, id, actor)?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(id)
+    }
+
+    fn record_event_review_tx(
+        tx: &rusqlite::Transaction<'_>,
+        candidate: &str,
+        replay: i64,
+        observation: i64,
+        actor: &str,
+        action: &str,
+        human: &str,
+        bridge: &str,
+        proposal: &str,
+        checkpoint: Option<(i64, &str)>,
+        preview_domain: Option<&str>,
+    ) -> Result<i64, String> {
         if [candidate, actor, human, bridge, proposal]
             .iter()
             .any(|v| v.trim().is_empty() || v.len() > 16_384)
@@ -1281,10 +1456,6 @@ impl Storage {
         {
             return Err("invalid event review".into());
         }
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
         if let Some((seq, hash)) = checkpoint {
             let head: Option<(i64, String)> = tx
                 .query_row(
@@ -1346,7 +1517,6 @@ impl Storage {
         tx.execute("INSERT INTO event_reviews(candidate_id,replay_id,observation_id,actor,action,human,bridge,proposal,created_unix_ns) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",params![candidate,replay,observation,actor,action,human,bridge,proposal,now]).map_err(|e|e.to_string())?;
         let id = tx.last_insert_rowid();
         crate::ledger::append_event_review(&tx, id)?;
-        tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
     }
     /// Returns a review and its referenced synthetic evidence from one verified snapshot.
@@ -3543,13 +3713,23 @@ impl Storage {
         review: i64,
         actor: &str,
     ) -> Result<(), String> {
-        if actor.trim().is_empty() || actor.len() > 256 {
-            return Err("invalid actor".into());
-        }
         let tx = self
             .conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        Self::promote_event_tx(&tx, domain, expected, review, actor)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+    fn promote_event_tx(
+        tx: &rusqlite::Transaction<'_>,
+        domain: &str,
+        expected: &str,
+        review: i64,
+        actor: &str,
+    ) -> Result<(), String> {
+        if actor.trim().is_empty() || actor.len() > 256 {
+            return Err("invalid actor".into());
+        }
         if !crate::ledger::verify_storage(&tx)? {
             return Err("ledger integrity failure".into());
         }
@@ -3640,7 +3820,7 @@ impl Storage {
         }
         tx.execute("INSERT INTO event_champion_transitions(domain,previous_id,next_id,reference,actor,created_unix_ns,kind) VALUES (?1,?2,?3,?4,?5,?6,'promote')",params![domain,current,candidate,review,actor,now]).map_err(|e|e.to_string())?;
         crate::ledger::append_event_champion_transition(&tx, tx.last_insert_rowid())?;
-        tx.commit().map_err(|e| e.to_string())
+        Ok(())
     }
     pub fn rollback_event(
         &mut self,

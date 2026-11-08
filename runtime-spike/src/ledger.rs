@@ -1084,6 +1084,33 @@ pub(crate) fn append_container_comparison_assertion(
     Ok(seq)
 }
 
+/// Record the local proposal source and artifact identity, not execution evidence.
+pub(crate) fn append_event_proposal(
+    conn: &Connection,
+    payload: &str,
+    time: &str,
+) -> Result<i64, String> {
+    let last: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT seq,hash FROM ledger_events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let (seq, prev) = match last {
+        Some((n, h)) => (n.checked_add(1).ok_or("ledger sequence overflow")?, h),
+        None => (1, "GENESIS".into()),
+    };
+    let digest = hash(&prev, "event_proposal", 0, payload, time);
+    conn.execute(
+        "INSERT INTO ledger_events VALUES (?1,'event_proposal',0,?2,?3,?4,?5)",
+        params![seq, payload, time, prev, digest],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(seq)
+}
+
 #[cfg(unix)]
 pub(crate) fn append_container_replay_experiment(
     conn: &Connection,

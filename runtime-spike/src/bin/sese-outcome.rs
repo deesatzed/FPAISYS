@@ -26,6 +26,30 @@ struct SyntheticPreferenceBundle {
     claim: JsonClaim<sese_runtime_spike::attestation::SyntheticPreferenceEvidence>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedCard {
+    human: String,
+    bridge: String,
+    proposal: String,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedEvaluation {
+    schema: String,
+    synthetic: bool,
+    review_recorded: bool,
+    domain: String,
+    candidate_id: String,
+    champion_id: String,
+    replay_id: i64,
+    observation_id: i64,
+    state_semantics: String,
+    checkpoint: serde_json::Value,
+    preview: serde_json::Value,
+    card: PreparedCard,
+}
+
 fn read_bounded_file(path: &str, limit: u64) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -66,7 +90,7 @@ fn decode_lower_hex<const N: usize>(text: &str) -> Result<[u8; N], &'static str>
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-register, event-review, event-review-preview, event-review-at, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
+        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-propose-threshold, event-propose-from-fixture, event-proposal-inspect, event-register, event-review, event-review-preview, event-review-prepared, event-review-at, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
     }
     if args[0] == "event-init" && args.len() == 2 {
         std::fs::OpenOptions::new()
@@ -84,6 +108,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut db = if matches!(
         args[0].as_str(),
         "event-training-export"
+            | "event-proposal-inspect"
             | "event-container-review-preview"
             | "event-container-observation-inspect"
     ) {
@@ -412,6 +437,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if observed.champion.is_none() || observed.shadow.is_none() {
                 return Err("synthetic observation failed".into());
             }
+        }
+        "event-propose-from-fixture" if args.len() == 3 => {
+            println!(
+                "{}",
+                db.record_fixture_proposal(&read_bounded_file(&args[2], 1_048_576)?)?
+            );
+        }
+        "event-proposal-inspect" if args.len() == 3 => {
+            println!("{}", db.inspect_fixture_proposal(args[2].parse()?)?)
+        }
+        "event-propose-threshold" if args.len() == 3 => {
+            let threshold: f64 = args[2].parse()?;
+            let artifact = sese_runtime_spike::proposal::threshold_artifact(threshold)?;
+            let candidate = db.register_event(&artifact)?;
+            println!(
+                "{}",
+                serde_json::json!({"schema":"sese-threshold-proposal-v1", "candidate_id":candidate,
+                "threshold":threshold, "rule":"throttle when metric > threshold; otherwise allow",
+                "generator":"local-threshold-v1", "executed":false, "validated":false, "classification":"not asserted by this command"})
+            );
         }
         "window-register" | "event-register" if args.len() == 3 => {
             let bytes = read_bounded_file(&args[2], 65_536)?;
@@ -923,6 +968,54 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "event-review-preview" if args.len() == 4 => {
             println!("{}", db.event_review_preview(args[3].parse()?, &args[2])?)
+        }
+        "event-review-prepared" if args.len() == 5 => {
+            let prepared: PreparedEvaluation =
+                serde_json::from_slice(&read_bounded_file(&args[2], 8_388_608)?)?;
+            if prepared.schema != "sese-prepared-synthetic-evaluation-v1"
+                || !prepared.synthetic
+                || prepared.review_recorded
+                || !["approve", "reject"].contains(&args[4].as_str())
+            {
+                return Err("invalid prepared evaluation or decision".into());
+            }
+            let preview = db.event_review_preview(prepared.replay_id, &prepared.domain)?;
+            if preview != prepared.preview
+                || preview["checkpoint"] != prepared.checkpoint
+                || preview["replay"]["candidate_id"] != prepared.candidate_id
+                || preview["replay"]["state_semantics"] != prepared.state_semantics
+                || preview["observations"]
+                    .as_array()
+                    .and_then(|v| v.last())
+                    .and_then(|v| v["id"].as_i64())
+                    != Some(prepared.observation_id)
+                || db.current_event_champion(&prepared.domain)? != prepared.champion_id
+            {
+                return Err("prepared evaluation no longer matches current evidence".into());
+            }
+            let seq = prepared.checkpoint["seq"]
+                .as_i64()
+                .ok_or("invalid prepared checkpoint")?;
+            let hash = prepared.checkpoint["hash"]
+                .as_str()
+                .ok_or("invalid prepared checkpoint")?;
+            let id = db.decide_prepared_event(
+                &prepared.domain,
+                &prepared.champion_id,
+                &prepared.candidate_id,
+                prepared.replay_id,
+                prepared.observation_id,
+                &args[3],
+                &args[4],
+                &prepared.card.human,
+                &prepared.card.bridge,
+                &prepared.card.proposal,
+                (seq, hash),
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"review_id":id,"synthetic":true,"promoted":args[4]=="approve"})
+            );
         }
         "event-review-at" if args.len() == 13 => {
             let id = db.record_event_review_from_preview(

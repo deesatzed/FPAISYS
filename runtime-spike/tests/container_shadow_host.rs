@@ -471,7 +471,7 @@ fn container_shadow_rejects_changed_ledger_during_execution() {
     let release = dir.join("release");
     let wrapper = dir.join("docker-wrapper");
     let quote = |p: &std::path::Path| format!("'{}'", p.to_str().unwrap().replace('\'', "'\\''"));
-    std::fs::write(&wrapper, format!("#!/bin/sh\nif [ \"$3\" = run ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
+    std::fs::write(&wrapper, format!("#!/bin/sh\nif [ \"$3\" = start ]; then : > {}; while [ ! -f {} ]; do /bin/sleep 0.05; done; fi\nexec /usr/local/bin/docker \"$@\"\n",quote(&marker),quote(&release))).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut db = Storage::open(&db_path).unwrap();
     let (champion, shadow) = setup(&mut db);
@@ -566,7 +566,7 @@ fn container_shadow_failure_records_champion_and_both_attempt_paths() {
     let marker = dir.join("first-run");
     let wrapper = dir.join("docker-wrapper");
     let marker = format!("'{}'", marker.to_str().unwrap().replace('\'', "'\\''"));
-    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = run ]; then if [ -e {marker} ]; then exit 1; fi; : > {marker}; fi\nexec /usr/local/bin/docker \"$@\"\n")).unwrap();
+    std::fs::write(&wrapper,format!("#!/bin/sh\nif [ \"$3\" = start ]; then if [ -e {marker} ]; then exit 1; fi; : > {marker}; fi\nexec /usr/local/bin/docker \"$@\"\n")).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let executor = SyntheticContainerExecutor::new(
         "/opt/homebrew/bin/python3",

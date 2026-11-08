@@ -25,6 +25,8 @@ mod container_review;
 mod container_shadow;
 pub mod event_executor;
 pub mod fixture_file;
+pub mod isolation_canary;
+pub mod proposal;
 pub mod reward_rule;
 mod synthetic_followup;
 #[cfg(any(target_os = "macos", target_os = "linux"))]

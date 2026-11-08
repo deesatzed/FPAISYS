@@ -145,7 +145,7 @@ fn display_verdict(value: &mut serde_json::Value) {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        return Err("usage: sese-event-cycle-demo EVENT_WORKER_PATH [NEW_DATABASE_PATH] [--candidate throttle|quarantine] [--measured] [--fixture FILE] [--events FILE] [--card FILE] [--followup-fixture FILE --followup-case ID]".into());
+        return Err("usage: sese-event-cycle-demo EVENT_WORKER_PATH [NEW_DATABASE_PATH] [--candidate throttle|quarantine] [--measured] [--prepare-only] [--fixture FILE] [--events FILE] [--card FILE] [--followup-fixture FILE --followup-case ID]".into());
     }
     let mut measured = false;
     let mut path = None;
@@ -155,6 +155,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut followup_path = None;
     let mut followup_case = None;
     let mut candidate_name = None;
+    let mut prepare_only = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -163,6 +164,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 candidate_name = Some(args[i].as_str());
             }
             "--measured" if !measured => measured = true,
+            "--prepare-only" if !prepare_only => prepare_only = true,
             "--fixture" if fixture_path.is_none() && i + 1 < args.len() => {
                 i += 1;
                 fixture_path = Some(args[i].as_str());
@@ -187,6 +189,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("invalid arguments".into()),
         }
         i += 1;
+    }
+    if prepare_only && path.is_none() {
+        return Err("prepare-only requires a new persistent database path".into());
     }
     // Only these fixed synthetic modules can run through this demo; user artifacts remain untrusted.
     let (candidate_label, candidate_decision, case_id, legacy_version, measured_version) =
@@ -313,15 +318,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let (Some(pack), Some(case_id)) = (followup_fixture, followup_case) {
         let follow =
             pack.replay_synthetic(&mut db, &args[0], &candidate, Duration::from_secs(2))?;
-        println!(
-            "Separate synthetic follow-up replay {}: passed={}; selected case={case_id}",
-            follow.run_id, follow.passed
-        );
-        for result in &follow.cases {
+        if !prepare_only || !follow.passed {
             println!(
-                "Follow-up replay case: {}",
-                serde_json::json!({"id":result.case.id,"window":window_value(result.case.window),"event":event_value(result.case.event),"expected":verdict_value(result.case.expected),"actual":result.actual.map(verdict_value),"error":result.error,"passed":result.passed})
+                "Separate synthetic follow-up replay {}: passed={}; selected case={case_id}",
+                follow.run_id, follow.passed
             );
+            for result in &follow.cases {
+                println!(
+                    "Follow-up replay case: {}",
+                    serde_json::json!({"id":result.case.id,"window":window_value(result.case.window),"event":event_value(result.case.event),"expected":verdict_value(result.case.expected),"actual":result.actual.map(verdict_value),"error":result.error,"passed":result.passed})
+                );
+            }
         }
         if !follow.passed {
             return Err("synthetic follow-up replay failed".into());
@@ -391,6 +398,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let review_hash = preview["checkpoint"]["hash"]
         .as_str()
         .ok_or("invalid preview checkpoint")?;
+    if prepare_only {
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"sese-prepared-synthetic-evaluation-v1",
+                "synthetic":true, "review_recorded":false, "domain":"typed-cycle",
+                "candidate_id":candidate, "champion_id":original,
+                "replay_id":replay.run_id, "observation_id":observed.id,
+                "state_semantics":semantics, "checkpoint":preview["checkpoint"],
+                "preview":preview,
+                "card":{"human":card.human,"bridge":card.bridge,"proposal":card.proposal}
+            })
+        );
+        return Ok(());
+    }
     println!("Review snapshot: {preview}");
     println!("Synthetic replay {}: candidate={candidate}", replay.run_id);
     for case in preview["replay"]["cases"]

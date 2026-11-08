@@ -1,0 +1,19 @@
+{
+  "schema": "sese-event-fixture-file-v1",
+  "version": "synthetic-threshold-training-v1",
+  "state_semantics": "measured-v2",
+  "cases": [
+    {
+      "id": "allow-low",
+      "window": { "count": 0, "mean": 0.0, "p99_us": 0, "last_error": 0 },
+      "event": { "timestamp_ns": 1, "entity_id": 42, "metric": 2.0, "flags": 4 },
+      "expected": { "decision": 0, "score": 2.0, "reason": 4 }
+    },
+    {
+      "id": "throttle-high",
+      "window": { "count": 0, "mean": 0.0, "p99_us": 0, "last_error": 0 },
+      "event": { "timestamp_ns": 2, "entity_id": 43, "metric": 3.0, "flags": 5 },
+      "expected": { "decision": 1, "score": 3.0, "reason": 5 }
+    }
+  ]
+}

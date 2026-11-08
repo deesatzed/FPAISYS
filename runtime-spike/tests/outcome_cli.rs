@@ -1,5 +1,236 @@
 use std::process::Command;
 
+#[test]
+fn fixture_driven_proposal_infers_a_threshold_without_executing_candidate() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-infer-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("db");
+    drop(sese_runtime_spike::storage::Storage::open(&db).unwrap());
+    let fixture = dir.join("training.json");
+    let source = serde_json::json!({"schema":"sese-event-fixture-file-v1", "version":"training-v1", "state_semantics":"measured-v2", "cases":[
+        {"id":"allow","window":{"count":0,"mean":0.0,"p99_us":0,"last_error":0},"event":{"timestamp_ns":1,"entity_id":1,"metric":2.0,"flags":4},"expected":{"decision":0,"score":2.0,"reason":4}},
+        {"id":"throttle","window":{"count":0,"mean":0.0,"p99_us":0,"last_error":0},"event":{"timestamp_ns":2,"entity_id":2,"metric":3.0,"flags":5},"expected":{"decision":1,"score":3.0,"reason":5}}
+    ]});
+    std::fs::write(&fixture, serde_json::to_vec(&source).unwrap()).unwrap();
+    let call = || {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .arg("event-propose-from-fixture")
+            .arg(&db)
+            .arg(&fixture)
+            .output()
+            .unwrap()
+    };
+    let result = call();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let proposal: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(proposal["threshold"], 2.0);
+    assert_eq!(proposal["training_cases"], 2);
+    assert_eq!(proposal["static_rule_fits_training"], true);
+    assert_eq!(proposal["executed"], false);
+    assert_eq!(proposal["validated"], false);
+    let proposal_seq = proposal["proposal_seq"].as_i64().unwrap();
+    assert_eq!(
+        proposal["training_fixture_digest"],
+        sese_runtime_spike::fixture_file::load(&fixture)
+            .unwrap()
+            .digest
+    );
+    let id = proposal["candidate_id"].as_str().unwrap();
+    let storage = sese_runtime_spike::storage::Storage::open_read_only(&db).unwrap();
+    assert_eq!(
+        storage.artifact(id).unwrap(),
+        sese_runtime_spike::proposal::threshold_artifact(2.0).unwrap()
+    );
+    drop(storage);
+    let inspected = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-proposal-inspect")
+        .arg(&db)
+        .arg(proposal_seq.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["candidate_id"], id);
+    assert_eq!(
+        inspected["training_fixture_digest"],
+        proposal["training_fixture_digest"]
+    );
+    assert_eq!(inspected["executed"], false);
+    assert_eq!(
+        inspected["training_fixture_json"]
+            .as_str()
+            .unwrap()
+            .as_bytes(),
+        serde_json::to_vec(&source).unwrap()
+    );
+    let mut overlapping = source.clone();
+    overlapping["cases"][1]["event"]["metric"] = 2.0.into();
+    overlapping["cases"][1]["expected"]["score"] = 2.0.into();
+    std::fs::write(&fixture, serde_json::to_vec(&overlapping).unwrap()).unwrap();
+    assert!(!call().status.success());
+    let mut one_class = source.clone();
+    one_class["cases"].as_array_mut().unwrap().pop();
+    std::fs::write(&fixture, serde_json::to_vec(&one_class).unwrap()).unwrap();
+    assert!(!call().status.success());
+    for (field, value) in [
+        ("score", serde_json::json!(99.0)),
+        ("reason", serde_json::json!(99)),
+        ("decision", serde_json::json!(2)),
+    ] {
+        let mut invalid = source.clone();
+        invalid["cases"][0]["expected"][field] = value;
+        std::fs::write(&fixture, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        let result = call();
+        assert!(!result.status.success(), "unexpectedly accepted {field}");
+        assert!(result.stdout.is_empty());
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (candidates, synthetic, replays): (i64, i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM candidates), (SELECT count(*) FROM synthetic_event_candidates), (SELECT count(*) FROM event_replay_runs)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!((candidates, synthetic, replays), (1, 0, 0));
+    conn.execute(
+        "UPDATE candidates SET artifact=?1 WHERE id=?2",
+        rusqlite::params![b"tampered".as_slice(), id],
+    )
+    .unwrap();
+    drop(conn);
+    let altered = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-proposal-inspect")
+        .arg(&db)
+        .arg(proposal_seq.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        !altered.status.success(),
+        "inspection accepted altered candidate bytes"
+    );
+    assert!(altered.stdout.is_empty());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fixture_proposal_rolls_back_candidate_if_ledger_write_fails() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-proposal-rollback-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("db");
+    drop(sese_runtime_spike::storage::Storage::open(&db).unwrap());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TRIGGER fail_proposal BEFORE INSERT ON ledger_events WHEN NEW.kind='event_proposal' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    drop(conn);
+    let result = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-propose-from-fixture")
+        .arg(&db)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/threshold-training-synthetic-v1.json"
+        ))
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let counts: (i64, i64) = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM candidates), (SELECT count(*) FROM ledger_events)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(counts, (0, 0));
+    drop(conn);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn local_threshold_proposal_registers_deterministic_unexecuted_wasm() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-proposal-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("db");
+    drop(sese_runtime_spike::storage::Storage::open(&path).unwrap());
+    let propose = |threshold: &str| {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .arg("event-propose-threshold")
+            .arg(&path)
+            .arg(threshold)
+            .output()
+            .unwrap()
+    };
+    let first = propose("3.5");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
+    assert_eq!(first["executed"], false);
+    assert_eq!(first["validated"], false);
+    assert_eq!(first["threshold"], 3.5);
+    let id = first["candidate_id"].as_str().unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&propose("3.5").stdout).unwrap();
+    assert_eq!(second["candidate_id"], id);
+    let different: serde_json::Value = serde_json::from_slice(&propose("4.5").stdout).unwrap();
+    assert_ne!(different["candidate_id"], id);
+    for input in ["NaN", "inf", "1000000000001", "(module)"] {
+        let invalid = propose(input);
+        assert!(!invalid.status.success());
+        assert!(invalid.stdout.is_empty());
+    }
+    let mut db = sese_runtime_spike::storage::Storage::open_read_only(&path).unwrap();
+    let bytes = db.artifact(id).unwrap();
+    let pack = sese_runtime_spike::fixture_file::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/fixtures/event-measured-synthetic-v1.json"
+    ))
+    .unwrap();
+    let error = pack
+        .replay_synthetic(
+            &mut db,
+            "/nonexistent/worker",
+            id,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert!(error.contains("not authorized"), "{error}");
+    drop(db);
+    let engine = wasmi::Engine::default();
+    let module = wasmi::Module::new(&engine, &bytes[..]).unwrap();
+    assert_eq!(module.imports().count(), 0);
+    assert!(module.exports().any(|e| e.name() == "evaluate_event_v1"));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (candidates, synthetic, replay): (i64, i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM candidates), (SELECT count(*) FROM synthetic_event_candidates), (SELECT count(*) FROM event_replay_runs)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!((candidates, synthetic, replay), (2, 0, 0));
+    drop(conn);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn candidate_intake_rejects_named_pipe_without_blocking_or_writing() {

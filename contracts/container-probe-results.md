@@ -1,5 +1,29 @@
 # Container isolation probe results
 
+On 2026-11-07, a newly built synthetic worker image included a fail-closed
+in-process Linux check before reading the guest request. It checked UID/GID,
+effective capabilities, no-new-privileges, seccomp filter mode, selected cgroup
+limits, the root mount, active non-loopback interfaces, IPv4 routes and the
+usual Docker socket path. Fixed synthetic input succeeded under the requested
+profile, and the worker refused it with bridge networking, a different memory
+limit, a writable root, or no-new-privileges disabled. The same image succeeded
+through the Rust container executor. The first
+check incorrectly rejected inactive tunnel interfaces on this host and was
+corrected to check active interfaces and routes. These checks are observations
+by the worker itself, do not authenticate the image, cover all access paths or
+prove kernel isolation, and do not authorize untrusted candidates.
+
+On 2026-11-07, the synthetic lifecycle was changed to create a container,
+inspect Docker's reported configuration while it is unstarted, and start it
+only if the requested identity, user, mounts, network, capability and resource
+settings match. A wrapper changed the network to `bridge`: before the change
+the synthetic worker ran successfully; afterward the helper rejected the
+configuration before starting it and recorded verified cleanup. Normal fixed
+synthetic workers and the lifecycle, replay and shadow tests also passed on
+Docker Desktop 29.5.2. This is a check of Docker's own unauthenticated report,
+not independent verification of kernel enforcement or authorization for
+arbitrary candidate execution.
+
 On 2026-11-06 a fixed synthetic `window-probe` ran through the local Docker
 worker with two distinct prior windows. Its verdict uses the supplied count,
 mean, p99 and last error; both results matched and had separate receipts. A

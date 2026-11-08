@@ -132,3 +132,25 @@ fn event_protocol_rejects_missing_response_and_truncated_request() {
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
 }
+#[test]
+fn isolation_required_worker_refuses_unrestricted_host_before_guest_execution() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let artifact = sese_runtime_spike::builtin_event::artifact("allow").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_event-worker"))
+        .arg("--require-isolation-v1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut request = vec![0_u8; 56];
+    request.extend_from_slice(&artifact);
+    let _ = child.stdin.take().unwrap().write_all(&request);
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        !result.status.success(),
+        "unrestricted worker accepted isolation-required request"
+    );
+    assert!(result.stdout.is_empty());
+}

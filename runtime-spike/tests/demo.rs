@@ -2,6 +2,270 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
+fn prepared_approval_rolls_back_review_if_promotion_write_fails() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-atomic-review-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("cycle.db");
+    let result = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db)
+        .arg("--prepare-only")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let prepared = dir.join("prepared.json");
+    let snapshot: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    std::fs::write(&prepared, result.stdout).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TRIGGER test_deny_promotion BEFORE UPDATE ON event_champions BEGIN SELECT RAISE(ABORT,'injected promotion failure'); END;").unwrap();
+    drop(conn);
+    let decision = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-review-prepared")
+        .arg(&db)
+        .arg(&prepared)
+        .args(["operator", "approve"])
+        .output()
+        .unwrap();
+    assert!(!decision.status.success());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (reviews, transitions): (i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM event_reviews), (SELECT count(*) FROM event_champion_transitions)", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(
+        (reviews, transitions),
+        (0, 1),
+        "failed promotion must not leave an approval"
+    );
+    let checkpoint: (i64, String) = conn
+        .query_row(
+            "SELECT seq, hash FROM ledger_events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        checkpoint.0,
+        snapshot["checkpoint"]["seq"].as_i64().unwrap()
+    );
+    assert_eq!(
+        checkpoint.1,
+        snapshot["checkpoint"]["hash"].as_str().unwrap()
+    );
+    conn.execute_batch("DROP TRIGGER test_deny_promotion")
+        .unwrap();
+    drop(conn);
+    let retried = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-review-prepared")
+        .arg(&db)
+        .arg(&prepared)
+        .args(["operator", "approve"])
+        .output()
+        .unwrap();
+    assert!(
+        retried.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn prepared_synthetic_evaluation_finishes_without_a_prompt_and_keeps_evidence() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-prepared-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db_path = dir.join("cycle.db");
+    let output = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db_path)
+        .args([
+            "--measured",
+            "--fixture",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fixtures/event-measured-synthetic-v1.json"
+            ),
+            "--prepare-only",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(!text.contains("Enter approve"));
+    let prepared: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(prepared["schema"], "sese-prepared-synthetic-evaluation-v1");
+    assert_eq!(prepared["state_semantics"], "measured-v2");
+    assert_eq!(prepared["synthetic"], true);
+    assert_eq!(prepared["review_recorded"], false);
+    let mut db = sese_runtime_spike::storage::Storage::open_read_only(&db_path).unwrap();
+    let preview = db
+        .event_review_preview(prepared["replay_id"].as_i64().unwrap(), "typed-cycle")
+        .unwrap();
+    assert_eq!(preview["checkpoint"], prepared["checkpoint"]);
+    assert_eq!(preview["replay"]["candidate_id"], prepared["candidate_id"]);
+    assert_eq!(preview["observations"][0]["id"], prepared["observation_id"]);
+    assert_eq!(
+        db.current_event_champion("typed-cycle").unwrap(),
+        prepared["champion_id"].as_str().unwrap()
+    );
+    drop(db);
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let (reviews, transitions): (i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM event_reviews), (SELECT count(*) FROM event_champion_transitions)", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((reviews, transitions), (0, 1));
+    drop(conn);
+    let prepared_path = dir.join("prepared.json");
+    std::fs::write(&prepared_path, &text).unwrap();
+    let decide = || {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .arg("event-review-prepared")
+            .arg(&db_path)
+            .arg(&prepared_path)
+            .args(["operator", "approve"])
+            .output()
+            .unwrap()
+    };
+    let decision = decide();
+    assert!(
+        decision.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decision.stderr)
+    );
+    let decision: serde_json::Value = serde_json::from_slice(&decision.stdout).unwrap();
+    assert_eq!(decision["promoted"], true);
+    let mut db = sese_runtime_spike::storage::Storage::open_read_only(&db_path).unwrap();
+    assert_eq!(
+        db.current_event_champion("typed-cycle").unwrap(),
+        prepared["candidate_id"].as_str().unwrap()
+    );
+    drop(db);
+    assert!(
+        !decide().status.success(),
+        "stale preparation must not be reused"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn prepared_review_rejects_altered_evidence_and_can_record_rejection() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-prepared-reject-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("cycle.db");
+    let result = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db)
+        .arg("--prepare-only")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut prepared: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let path = dir.join("prepared.json");
+    prepared["preview"]["observations"][0]["event"]["metric"] = 100.into();
+    std::fs::write(&path, serde_json::to_vec(&prepared).unwrap()).unwrap();
+    let decide = |action: &str| {
+        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+            .arg("event-review-prepared")
+            .arg(&db)
+            .arg(&path)
+            .args(["operator", action])
+            .output()
+            .unwrap()
+    };
+    assert!(!decide("approve").status.success());
+    std::fs::write(&path, &result.stdout).unwrap();
+    let rejected = decide("reject");
+    assert!(
+        rejected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    let response: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
+    assert_eq!(response["promoted"], false);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (reviews, transitions, action): (i64, i64, String) = conn.query_row("SELECT (SELECT count(*) FROM event_reviews), (SELECT count(*) FROM event_champion_transitions), (SELECT action FROM event_reviews LIMIT 1)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!((reviews, transitions, action.as_str()), (1, 1, "reject"));
+    drop(conn);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn prepared_evaluation_requires_persistent_storage_and_never_promotes_failed_replay() {
+    let demo = env!("CARGO_BIN_EXE_sese-event-cycle-demo");
+    let worker = env!("CARGO_BIN_EXE_event-worker");
+    let without_path = Command::new(demo)
+        .args([worker, "--prepare-only"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!without_path.status.success());
+    let dir = std::env::temp_dir().join(format!(
+        "sese-prepared-failed-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("cycle.db");
+    let failed = Command::new(demo)
+        .arg(worker)
+        .arg(&db)
+        .args([
+            "--prepare-only",
+            "--candidate",
+            "quarantine",
+            "--fixture",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/fixtures/event-synthetic-v1.json"
+            ),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(serde_json::from_slice::<serde_json::Value>(&failed.stdout).is_err());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (reviews, transitions): (i64, i64) = conn.query_row("SELECT (SELECT count(*) FROM event_reviews), (SELECT count(*) FROM event_champion_transitions)", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!((reviews, transitions), (0, 0));
+    drop(conn);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn typed_cycle_selects_a_known_synthetic_candidate_and_rejects_wrong_fixture() {
     let suffix = format!(
         "{}-{}",

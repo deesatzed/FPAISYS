@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from synthetic_container_lifecycle import inspect_pending, run_synthetic
+from synthetic_container_lifecycle import _configuration_matches, _synthetic_request, inspect_pending, run_synthetic
 
 
 class ContainerLifecycleTests(unittest.TestCase):
@@ -23,6 +23,108 @@ class ContainerLifecycleTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.journal_dir = directory.name
         self.docker_host = os.environ.get("SESE_TEST_DOCKER_HOST", "unix:///nonexistent/docker.sock")
+
+    def make_pending(self, path):
+        """Construct an unresolved creation intent for the journal and recovery tests."""
+        record = json.loads(path.read_text())
+        record.update(schema="sese-synthetic-container-intent-v4", state="pending")
+        path.write_text(json.dumps(record))
+
+    def test_configuration_check_rejects_missing_and_relaxed_restrictions(self):
+        container, image, name = "a" * 64, "sha256:" + "b" * 64, "sese-synthetic-" + "c" * 32
+        report = {"Id": container, "Image": image, "Mounts": [],
+                  "State": {"Status": "created", "Running": False},
+                  "Config": {"Image": image, "User": "65534:65534", "OpenStdin": True,
+                             "Labels": {"io.sese.synthetic-probe": name}},
+                  "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
+                                 "CapAdd": None, "SecurityOpt": ["no-new-privileges"], "Privileged": False,
+                                 "PidsLimit": 16, "Memory": 134217728, "MemorySwap": 134217728,
+                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None,
+                                 "Devices": None, "DeviceRequests": None, "PidMode": "", "IpcMode": "private", "UTSMode": ""}}
+        check = lambda obj: _configuration_matches(json.dumps(obj), container, image, name)
+        self.assertTrue(check(report))
+        for section, field, value in [("HostConfig", "NetworkMode", "bridge"), ("HostConfig", "ReadonlyRootfs", False),
+                ("HostConfig", "CapDrop", []), ("HostConfig", "CapAdd", ["SYS_ADMIN"]),
+                ("HostConfig", "SecurityOpt", ["seccomp=unconfined"]), ("HostConfig", "Memory", 0),
+                ("HostConfig", "MemorySwap", -1), ("HostConfig", "PidsLimit", 0),
+                ("HostConfig", "NanoCpus", 0), ("HostConfig", "Privileged", True),
+                ("HostConfig", "PidMode", "host"), ("HostConfig", "IpcMode", "host"),
+                ("HostConfig", "Binds", ["/host:/host"]), ("Config", "User", "0"),
+                ("State", "Running", True)]:
+            with self.subTest(field=field):
+                changed = json.loads(json.dumps(report))
+                changed[section][field] = value
+                self.assertFalse(check(changed))
+                del changed[section][field]
+                self.assertFalse(check(changed))
+        self.assertFalse(_configuration_matches("not json", container, image, name))
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a worker image with the isolation self-check")
+    def test_worker_self_check_accepts_profile_and_rejects_relaxed_restrictions(self):
+        docker = shutil.which("docker")
+        base = [docker, "--host", self.docker_host]
+        request, _ = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+        cases = [("none", "128m", True, True, True), ("bridge", "128m", True, True, False),
+                 ("none", "256m", True, True, False), ("none", "128m", False, True, False),
+                 ("none", "128m", True, False, False)]
+        for network, memory, readonly, no_new_privs, should_succeed in cases:
+            with self.subTest(network=network, memory=memory, readonly=readonly, no_new_privs=no_new_privs):
+                args = ["create", "--pull=never", "--interactive", "--network=" + network, "--cap-drop=ALL",
+                        "--pids-limit=16", "--memory=" + memory, "--memory-swap=" + memory, "--cpus=1", "--user=65534:65534"]
+                if readonly:
+                    args.append("--read-only")
+                if no_new_privs:
+                    args.append("--security-opt=no-new-privileges")
+                created = subprocess.check_output(base + args + [os.environ["SESE_TEST_CANARY_IMAGE"]], text=True, timeout=15).strip()
+                self.assertRegex(created, r"^[0-9a-f]{64}$")
+                try:
+                    result = subprocess.run(base + ["start", "--attach", "--interactive", created],
+                                            input=request, capture_output=True, timeout=20)
+                    self.assertEqual(result.returncode == 0, should_succeed)
+                    if should_succeed:
+                        self.assertEqual(struct.unpack("<IdI", result.stdout), (1, 3.0, 4))
+                    else:
+                        self.assertEqual(result.stdout, b"")
+                finally:
+                    subprocess.run(base + ["rm", "-f", created], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=10, check=True)
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
+    def test_refuses_changed_network_before_starting_worker(self):
+        docker = shutil.which("docker")
+        marker = Path(self.journal_dir) / "worker-started"
+        wrapper = Path(self.journal_dir) / "docker-wrapper"
+        wrapper.write_text("#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\n"
+                           + "if len(a)>2 and a[2] in ('run','start'): open(" + repr(str(marker)) + ",'w').close()\n"
+                           + "if len(a)>2 and a[2] in ('run','create'): a[a.index('--network=none')]='--network=bridge'\n"
+                           + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+        wrapper.chmod(0o700)
+        with self.assertRaisesRegex(RuntimeError, "configuration"):
+            run_synthetic(os.environ["SESE_TEST_IMAGE"], docker=str(wrapper),
+                          journal_dir=self.journal_dir, docker_host=self.docker_host, timeout=30)
+        self.assertFalse(marker.exists(), "worker was started before configuration verification")
+        receipt = json.loads(next(Path(self.journal_dir).glob("sese-synthetic-*.json")).read_text())
+        self.assertEqual(receipt["state"], "removed")
+        self.assertEqual(receipt["result_status"], "failed")
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
+    def test_inspection_obeys_evaluation_deadline_and_cleans_created_container(self):
+        docker = shutil.which("docker")
+        marker = Path(self.journal_dir) / "worker-started"
+        wrapper = Path(self.journal_dir) / "slow-inspect"
+        wrapper.write_text("#!/usr/bin/env python3\nimport os,sys,time\na=sys.argv[1:]\n"
+                           + "if len(a)>2 and a[2]=='start': open(" + repr(str(marker)) + ",'w').close()\n"
+                           + "if len(a)>4 and a[2:5]==['inspect','--type','container']: time.sleep(8)\n"
+                           + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+        wrapper.chmod(0o700)
+        started = time.monotonic()
+        with self.assertRaises(RuntimeError):
+            run_synthetic(os.environ["SESE_TEST_IMAGE"], docker=str(wrapper), timeout=2,
+                          journal_dir=self.journal_dir, docker_host=self.docker_host)
+        self.assertLess(time.monotonic() - started, 4.5, "inspection ignored the evaluation deadline")
+        self.assertFalse(marker.exists())
+        receipt = json.loads(next(Path(self.journal_dir).glob("sese-synthetic-*.json")).read_text())
+        self.assertEqual((receipt["state"], receipt["result_status"]), ("removed", "failed"))
 
     def test_invalid_caller_probe_name_fails_before_receipt_or_backend(self):
         with self.assertRaisesRegex(ValueError, "probe name"):
@@ -36,7 +138,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         wrapper = Path(self.journal_dir) / "docker-cleanup-volumes"
         launch_marker = Path(self.journal_dir) / "launched"
         wrapper.write_text("#!/bin/sh\nif [ \"$3\" = rm ]; then exec " + shlex.quote(shutil.which("docker"))
-                           + " \"$1\" \"$2\" rm -fv \"$5\"; fi\nif [ \"$3\" = run ]; then touch "
+                           + " \"$1\" \"$2\" rm -fv \"$5\"; fi\nif [ \"$3\" = create ]; then touch "
                            + shlex.quote(str(launch_marker)) + "; fi\nexec " + shlex.quote(shutil.which("docker")) + " \"$@\"\n")
         wrapper.chmod(0o700)
         with self.assertRaisesRegex(RuntimeError, "image declares volumes"):
@@ -68,7 +170,7 @@ class ContainerLifecycleTests(unittest.TestCase):
             self.assertEqual(record["candidate"], candidate)
             self.assertEqual(record["artifact_sha256"], result["artifact_sha256"])
 
-    def test_creation_intent_is_recorded_before_backend_launch(self):
+    def test_preflight_failure_records_no_creation(self):
         image = "sha256:" + "0" * 64
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
             run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir, docker_host=self.docker_host)
@@ -76,21 +178,100 @@ class ContainerLifecycleTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         record = json.loads(records[0].read_text())
         self.assertEqual(record["image"], image)
-        self.assertEqual(record["state"], "pending")
+        self.assertEqual(record["state"], "not_created")
         self.assertEqual(record["candidate"], "throttle")
         self.assertEqual(record["artifact_sha256"], "98dd40bc296ce558a939e9c72600a6e95cd1d4105d6758df48e4becb80bbcabe")
         self.assertEqual(record["request_sha256"], "86a17193bc133c6fd6add5f4ac1407da2cc7b6ac8b89631522a65995401a01d1")
         self.assertRegex(record["name"], r"^sese-synthetic-[0-9a-f]{32}$")
         self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
         result = inspect_pending(records[0], docker="/nonexistent/docker")
-        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["status"], "not_created")
         self.assertEqual(result["name"], record["name"])
+
+    def test_failed_preflight_does_not_block_a_later_attempt(self):
+        image = "sha256:" + "0" * 64
+        for _ in range(2):
+            with self.assertRaisesRegex(RuntimeError, "daemon identity unconfirmed"):
+                run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir,
+                              docker_host=self.docker_host)
+        records = list(Path(self.journal_dir).glob("sese-synthetic-*.json"))
+        self.assertEqual(len(records), 2)
+        self.assertTrue(all(json.loads(p.read_text())["state"] == "not_created" for p in records))
+
+    def test_malformed_preflight_remains_blocking(self):
+        image = "sha256:" + "0" * 64
+        with self.assertRaisesRegex(RuntimeError, "daemon identity unconfirmed"):
+            run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir,
+                          docker_host=self.docker_host)
+        receipt = next(Path(self.journal_dir).glob("sese-synthetic-*.json"))
+        record = json.loads(receipt.read_text())
+        record["artifact_sha256"] = "0" * 64
+        receipt.write_text(json.dumps(record))
+        with self.assertRaisesRegex(RuntimeError, "unresolved synthetic container receipt"):
+            run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir,
+                          docker_host=self.docker_host)
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
+    def test_successful_run_after_failed_preflight_needs_no_recovery(self):
+        image = os.environ["SESE_TEST_IMAGE"]
+        with self.assertRaisesRegex(RuntimeError, "daemon identity unconfirmed"):
+            run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir,
+                          docker_host=self.docker_host)
+        result = run_synthetic(image, docker=shutil.which("docker"), journal_dir=self.journal_dir,
+                               docker_host=self.docker_host, timeout=20)
+        self.assertEqual(result["verdict"], (1, 3.0, 4))
+        states = [json.loads(p.read_text())["state"] for p in Path(self.journal_dir).glob("sese-synthetic-*.json")]
+        self.assertCountEqual(states, ["not_created", "removed"])
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
+    def test_creation_intent_precedes_real_create_and_ambiguous_creation_blocks_retry(self):
+        docker = shutil.which("docker")
+        marker = Path(self.journal_dir) / "create-observed.json"
+        wrapper = Path(self.journal_dir) / "ambiguous-create"
+        wrapper.write_text("#!/usr/bin/env python3\nimport json,os,pathlib,subprocess,sys\na=sys.argv[1:]\n"
+            + "if len(a)>2 and a[2]=='create':\n"
+            + " n=a[a.index('--name')+1]; p=pathlib.Path(" + repr(self.journal_dir) + ")/(n+'.json'); r=json.loads(p.read_text());\n"
+            + " pathlib.Path(" + repr(str(marker)) + ").write_text(json.dumps(r));\n"
+            + " x=subprocess.run([" + repr(docker) + "]+a,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); sys.exit(1 if x.returncode==0 else x.returncode)\n"
+            + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+        wrapper.chmod(0o700)
+        container_id = None
+        try:
+            with self.assertRaisesRegex(RuntimeError, "creation.*unconfirmed"):
+                run_synthetic(os.environ["SESE_TEST_IMAGE"], docker=str(wrapper),
+                              journal_dir=self.journal_dir, docker_host=self.docker_host, timeout=20)
+            before = json.loads(marker.read_text())
+            self.assertEqual(before["schema"], "sese-synthetic-container-intent-v4")
+            self.assertEqual(before["state"], "pending")
+            self.assertIsInstance(before["daemon_id"], str)
+            receipt = Path(self.journal_dir) / (before["name"] + ".json")
+            observed = inspect_pending(receipt, docker=docker)
+            self.assertEqual(observed["status"], "observed")
+            self.assertFalse(observed["running"])
+            container_id = observed["container_id"]
+            with self.assertRaisesRegex(RuntimeError, "unresolved synthetic container receipt"):
+                run_synthetic(os.environ["SESE_TEST_IMAGE"], docker=docker,
+                              journal_dir=self.journal_dir, docker_host=self.docker_host)
+        finally:
+            if container_id is None and marker.exists():
+                name = json.loads(marker.read_text())["name"]
+                found = subprocess.run([docker, "--host", self.docker_host, "inspect", "--format",
+                                        '{{.Id}}|{{index .Config.Labels "io.sese.synthetic-probe"}}', name],
+                                       capture_output=True, text=True, timeout=10)
+                if found.returncode == 0:
+                    found_id, label = found.stdout.strip().split("|", 1)
+                    if label == name and re.fullmatch(r"[0-9a-f]{64}", found_id):
+                        container_id = found_id
+            if container_id:
+                subprocess.run([docker, "--host", self.docker_host, "rm", "-f", container_id],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=10)
 
     def test_unresolved_intent_blocks_another_attempt(self):
         image = "sha256:" + "0" * 64
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
             run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir, docker_host=self.docker_host)
         before = sorted(Path(self.journal_dir).glob("sese-synthetic-*.json"))
+        self.make_pending(before[0])
         with self.assertRaisesRegex(RuntimeError, "unresolved synthetic container receipt"):
             run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir, docker_host=self.docker_host)
         self.assertEqual(sorted(Path(self.journal_dir).glob("sese-synthetic-*.json")), before)
@@ -100,6 +281,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
             run_synthetic(image, docker="/nonexistent/docker", journal_dir=self.journal_dir, docker_host=self.docker_host)
         receipt = next(Path(self.journal_dir).glob("sese-synthetic-*.json"))
+        self.make_pending(receipt)
         before = receipt.read_bytes()
         inspected = subprocess.run([sys.executable, str(Path(__file__).parent / "synthetic_container_recover.py"), str(receipt), "--inspect-only", "--docker", "/nonexistent/docker"], capture_output=True, text=True, timeout=10)
         self.assertEqual(inspected.returncode, 0, inspected.stderr)
@@ -120,7 +302,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         self.assertEqual(receipt.read_bytes(), before)
         self.assertEqual(list(Path(self.journal_dir).glob(".sese-recovery-*.json")), [])
 
-    def test_parallel_attempt_waits_then_observes_pending_receipt(self):
+    def test_parallel_attempt_waits_then_retries_after_preflight_failure(self):
         marker = Path(self.journal_dir) / "started"
         release = Path(self.journal_dir) / "release"
         wrapper = Path(self.journal_dir) / "docker-wrapper"
@@ -145,8 +327,8 @@ class ContainerLifecycleTests(unittest.TestCase):
                 _, second_error = second.communicate(timeout=10)
         self.assertNotEqual(first.returncode, 0, first_error.decode())
         self.assertNotEqual(second.returncode, 0)
-        self.assertIn("unresolved synthetic container receipt", second_error.decode())
-        self.assertEqual(len(list(Path(self.journal_dir).glob("sese-synthetic-*.json"))), 1)
+        self.assertIn("daemon identity unconfirmed", second_error.decode())
+        self.assertEqual(len(list(Path(self.journal_dir).glob("sese-synthetic-*.json"))), 2)
 
     def test_journal_lock_wait_has_deadline(self):
         fd = os.open(self.journal_dir, os.O_RDONLY)

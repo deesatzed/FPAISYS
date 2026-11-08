@@ -1,6 +1,7 @@
 # Synthetic event-cycle walkthrough
 
 For the same synthetic lifecycle using separate operator commands and explicit decisions, see [MANUAL_CYCLE.md](MANUAL_CYCLE.md).
+For a shorter noninteractive preparation followed by one decision command, see [README.md](README.md).
 
 This walkthrough runs fixed synthetic Wasm guests against local sample data. The worker is not an OS sandbox: do not use untrusted candidates or sensitive data. It requires Rust/Cargo and Python 3; run commands from the repository root.
 
