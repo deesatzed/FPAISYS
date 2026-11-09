@@ -1229,7 +1229,7 @@ impl Storage {
             cases
         };
         let timings = crate::ledger::event_replay_timings(conn, id)?;
-        let value = serde_json::json!({"schema":"sese-synthetic-event-replay-inspection-v1","id":id,"candidate_id":verified.candidate_id,"fixture_version":verified.pack_version,"fixture_digest":verified.pack_digest,"state_semantics":verified.state_semantics,"passed":verified.passed,"started_unix_ns":started,"worker":{"path":worker_path,"sha256":worker_sha256},"cases":cases,"case_timings":timings,"synthetic":true});
+        let value = serde_json::json!({"schema":"sese-synthetic-event-replay-inspection-v1","id":id,"candidate_id":verified.candidate_id,"fixture_version":verified.pack_version,"fixture_digest":verified.pack_digest,"state_semantics":verified.state_semantics,"passed":verified.passed,"started_unix_ns":started,"worker":{"path":worker_path,"sha256":worker_sha256},"runtime_provenance_verified":false,"cases":cases,"case_timings":timings,"synthetic":true});
         Ok(value)
     }
     fn verify_event_replay_conn(
@@ -3590,7 +3590,7 @@ impl Storage {
                     }
                     values
                 };
-                let v = serde_json::json!({"schema":"sese-synthetic-event-outcome-v1","review_id":id,"candidate_id":candidate,"replay_id":replay,"fixture_version":evidence.pack_version,"fixture_digest":evidence.pack_digest,"state_semantics":evidence.state_semantics,"replay_worker_sha256":worker_hash,"observation_worker_sha256":observation_worker_hash,"observation_id":observation,"domain":domain,"review_actor":review_actor,"decision":decision,"outcome":status,"outcome_actor":outcome_actor,"outcome_source":source,"outcome_unix_ns":time,"outcome_evidence":"caller_asserted","synthetic_followup_receipts":followups,"synthetic":true,"training_ready":false});
+                let v = serde_json::json!({"schema":"sese-synthetic-event-outcome-v1","review_id":id,"candidate_id":candidate,"replay_id":replay,"fixture_version":evidence.pack_version,"fixture_digest":evidence.pack_digest,"state_semantics":evidence.state_semantics,"runtime_provenance_verified":false,"replay_worker_sha256":worker_hash,"observation_worker_sha256":observation_worker_hash,"observation_id":observation,"domain":domain,"review_actor":review_actor,"decision":decision,"outcome":status,"outcome_actor":outcome_actor,"outcome_source":source,"outcome_unix_ns":time,"outcome_evidence":"caller_asserted","synthetic_followup_receipts":followups,"synthetic":true,"training_ready":false});
                 output.push_str(&v.to_string());
                 output.push('\n');
             }

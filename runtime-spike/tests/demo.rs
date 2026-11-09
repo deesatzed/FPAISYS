@@ -240,6 +240,24 @@ fn prepared_synthetic_evaluation_finishes_without_a_prompt_and_keeps_evidence() 
     drop(conn);
     let prepared_path = dir.join("prepared.json");
     std::fs::write(&prepared_path, &text).unwrap();
+    let mut old_preview = prepared.clone();
+    old_preview["preview"]["replay"]
+        .as_object_mut()
+        .unwrap()
+        .remove("runtime_provenance_verified");
+    let old_path = dir.join("old-prepared.json");
+    std::fs::write(&old_path, old_preview.to_string()).unwrap();
+    let old_decision = Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
+        .arg("event-review-prepared")
+        .arg(&db_path)
+        .arg(&old_path)
+        .args(["operator", "approve"])
+        .output()
+        .unwrap();
+    assert!(
+        !old_decision.status.success(),
+        "old preview must be regenerated"
+    );
     let decide = || {
         Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
             .arg("event-review-prepared")

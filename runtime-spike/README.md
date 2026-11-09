@@ -215,7 +215,7 @@ sese-outcome event-resolve DB REVIEW_ID validated|falsified ACTOR SOURCE
 sese-outcome event-export DB
 ```
 
-Resolution is a caller assertion about the decision, not independent validation. Export excludes pending reviews, verifies linked evidence, and labels records synthetic and `training_ready: false`. It does not assign a reward or generate SFT/DPO/RLVR training examples.
+Resolution is a caller assertion about the decision, not independent validation. Typed replay inspection and outcome export report `runtime_provenance_verified: false`: recorded worker hashes do not establish the runtime's origin or trustworthiness. Prepared reviews created before this field was added must be regenerated. Export excludes pending reviews, verifies linked evidence, and labels records synthetic and `training_ready: false`. It does not assign a reward or generate SFT/DPO/RLVR training examples.
 
 Resolved typed-event export rows include `synthetic_followup_receipts` for that review, or an empty array when none exist. Each included comparison is recomputed in the export's verified snapshot; invalid evidence or more than 1,000 receipts for a review causes export to fail. These synthetic comparisons are separate from the caller-asserted outcome and do not validate it. Pending reviews remain excluded.
 

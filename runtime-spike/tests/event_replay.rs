@@ -131,6 +131,7 @@ fn replay_records_case_timestamps_and_durations_for_success_and_failure() {
     drop(db);
     let mut db = Storage::open(&path).unwrap();
     let inspection = db.inspect_event_replay(report.run_id).unwrap();
+    assert_eq!(inspection["runtime_provenance_verified"], false);
     let timings = inspection["case_timings"].as_array().unwrap();
     assert_eq!(timings.len(), 2);
     for (index, timing) in timings.iter().enumerate() {

@@ -547,6 +547,7 @@ fn outcome_and_export_distinguish_pending_and_resolved() {
     assert_eq!(v["review_id"], review);
     assert_eq!(v["outcome_source"], "synthetic follow-up");
     assert_eq!(v["outcome_evidence"], "caller_asserted");
+    assert_eq!(v["runtime_provenance_verified"], false);
     assert_eq!(v["synthetic"], true);
     assert_eq!(v["training_ready"], false);
     assert_eq!(v["synthetic_followup_receipts"], serde_json::json!([]));
