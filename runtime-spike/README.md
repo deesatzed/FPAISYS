@@ -188,7 +188,7 @@ runtime-spike/target/debug/sese-outcome event-replay-inspect synthetic.db 1
 
 `event-init` refuses existing paths. Built-in names are `allow`, `throttle`, `quarantine`, and `window-probe`; registration does not execute them. The fixed `window-probe` returns an allow verdict with score `prior.mean + prior.count + prior.p99_us` and reason `prior.last_error`, to check that prior state reaches the guest. Replay accepts a name rather than arbitrary code, checks the registered artifact and uses the `event-worker` binary beside `sese-outcome`. Use a trusted local installation of both binaries. It records real case results and prints the run ID and pass status; a failed replay returns a nonzero exit code after printing its result. These commands do not create an observation, approve a candidate or provide a sandbox.
 
-An `event-pin` selection now requires a passed, verified replay. Bootstrap also rechecks that the selected replay passed, including for older databases whose failed selections remain available for inspection. A passing replay does not prove fixture quality or authorize untrusted execution.
+`event-pin` requires the explicit `replay:ID` form and a passed, verified ordinary replay. Bare numbers are rejected to make accidental use of a container ledger sequence less likely. The prefix is an operator assertion: relabeling a container sequence as a replay ID can still select a different replay with the same number. Bootstrap also rechecks that the selected replay passed, including for older databases whose failed selections remain available for inspection. A passing replay does not prove fixture quality or authorize untrusted execution.
 
 To produce a shadow observation separately, register the `allow` built-in, pin the successful replay for a domain, and bootstrap `allow` as champion using its returned candidate ID. Then run:
 
@@ -275,7 +275,7 @@ To compare an exported record with its source, use `event-evidence-verify DB EXP
 An operator can select an existing, ledger-bound typed-event replay as a domain's fixture and compare later runs against its exact version and digest:
 
 ```text
-sese-outcome event-pin DB DOMAIN REPLAY_ID ACTOR
+sese-outcome event-pin DB DOMAIN replay:REPLAY_ID ACTOR
 sese-outcome event-pin-match DB DOMAIN REPLAY_ID
 ```
 

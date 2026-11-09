@@ -43,7 +43,7 @@ fn promotion_rejects_followup_selected_after_approval() {
         "/fixtures/event-followup-synthetic-v1.json"
     );
     run(&["event-builtin-replay", "throttle", main]);
-    run(&["event-pin", "test", "1", "operator"]);
+    run(&["event-pin", "test", "replay:1", "operator"]);
     run(&["event-builtin-replay", "throttle", follow]);
     run(&["event-builtin-replay", "throttle", main]);
     run(&["event-bootstrap", "test", allow, "operator"]);

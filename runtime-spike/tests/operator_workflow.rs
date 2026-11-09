@@ -38,11 +38,14 @@ fn measured_operator_stream_preserves_state_and_rejects_wrong_semantics() {
         fixture_path,
     ]))
     .unwrap();
+    let bare = replay["run_id"].as_i64().unwrap().to_string();
+    let ambiguous = run(&["event-pin", db, "domain", &bare, "operator"]);
+    assert!(!ambiguous.status.success(), "bare replay IDs must be rejected");
     success(&[
         "event-pin",
         db,
         "domain",
-        &replay["run_id"].as_i64().unwrap().to_string(),
+        &format!("replay:{}", replay["run_id"].as_i64().unwrap()),
         "operator",
     ]);
     success(&[
@@ -160,7 +163,7 @@ fn operator_observes_and_reviews_a_durable_synthetic_stream() {
     ]))
     .unwrap();
     let run_id = replay["run_id"].as_i64().unwrap().to_string();
-    success(&["event-pin", db, "domain", &run_id, "operator"]);
+    success(&["event-pin", db, "domain", &format!("replay:{run_id}"), "operator"]);
     success(&[
         "event-bootstrap",
         db,
@@ -407,7 +410,7 @@ fn operator_can_register_and_replay_fixed_candidates_across_processes() {
     let mismatch: serde_json::Value = serde_json::from_slice(&mismatch.stdout).unwrap();
     assert_eq!(mismatch["passed"], false);
     let failed_run = mismatch["run_id"].as_i64().unwrap().to_string();
-    let rejected_pin = run(&["event-pin", db, "failed-domain", &failed_run, "operator"]);
+    let rejected_pin = run(&["event-pin", db, "failed-domain", &format!("replay:{failed_run}"), "operator"]);
     assert!(!rejected_pin.status.success());
     let allow = run(&["event-builtin-register", db, "allow"]);
     assert!(allow.status.success());

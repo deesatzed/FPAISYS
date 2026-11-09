@@ -25,7 +25,7 @@ Inspect the expected and actual case results. Continue only if `passed` is true.
 ## Select the fixture and observe
 
 ```sh
-"$SSESE_CMD" event-pin "$SSESE_DB" manual "$SSESE_REPLAY" local-operator
+"$SSESE_CMD" event-pin "$SSESE_DB" manual "replay:$SSESE_REPLAY" local-operator
 "$SSESE_CMD" event-bootstrap "$SSESE_DB" manual "$SSESE_CHAMPION" local-operator
 "$SSESE_CMD" event-builtin-observe "$SSESE_DB" manual manual-stream allow throttle measured-v2 1 42 3 4 > "$SSESE_DIR/first-observation.json"
 "$SSESE_CMD" event-builtin-observe "$SSESE_DB" manual manual-stream allow throttle measured-v2 2 43 5 1 > "$SSESE_DIR/observation.json"

@@ -396,7 +396,7 @@ fn cli_records_and_inspects_review_across_processes() {
             "event-pin",
             path.to_str().unwrap(),
             "domain",
-            &replay.to_string(),
+            &format!("replay:{replay}"),
             "operator",
         ])
         .output()

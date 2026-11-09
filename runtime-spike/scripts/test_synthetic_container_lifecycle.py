@@ -970,7 +970,7 @@ class ContainerLifecycleTests(unittest.TestCase):
             inspect = subprocess.run([str(cli), "event-container-replay-inspect", str(db), str(report["container_event_seq"])], capture_output=True, text=True, timeout=30)
             self.assertEqual(inspect.returncode, 0, inspect.stderr)
             self.assertFalse(json.loads(inspect.stdout)["promotion_evidence"])
-            pin = subprocess.run([str(cli), "event-pin", str(db), "domain", str(report["container_event_seq"]), "operator"], capture_output=True, text=True, timeout=30)
+            pin = subprocess.run([str(cli), "event-pin", str(db), "domain", f'replay:{report["container_event_seq"]}', "operator"], capture_output=True, text=True, timeout=30)
             self.assertNotEqual(pin.returncode, 0)
             with sqlite3.connect(db) as conn:
                 self.assertEqual(conn.execute("SELECT count(*) FROM event_replay_runs").fetchone()[0], 0)

@@ -712,7 +712,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("Synthetic event champion metadata rolled back");
         }
         "event-pin" if args.len() == 5 => {
-            db.pin_event_fixture(&args[2], args[3].parse()?, &args[4])?;
+            let replay = args[3].strip_prefix("replay:").ok_or("event-pin requires replay:<ordinary replay ID>; container event sequences are not replay IDs")?;
+            db.pin_event_fixture(&args[2], replay.parse()?, &args[4])?;
             println!("Synthetic event fixture selected");
         }
         "event-pin-match" if args.len() == 4 => {
