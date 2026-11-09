@@ -188,3 +188,9 @@ expand the controlled host-access and network tests; test deadline, OOM,
 daemon failure, output and process limits, cleanup and concurrent
 runs; establish image and runtime provenance; and perform an independent
 security assessment. Docker's VM, daemon and host remain in the threat model.
+
+## Worker substitution despite matching image configuration
+
+On 2026-11-09, a disposable container was created from the fixed synthetic worker image, its `/event-worker` executable was replaced with a fixed local shell script, and the result was committed as a temporary image. The replacement consumed its input and returned the expected 16-byte synthetic verdict without interpreting it. The image retained the reported user, entrypoint and environment required by the launcher. `run_synthetic(..., require_worker_profile=True)` accepted the image and returned that verdict. The disposable container and image were removed; the lifecycle's own probe container was removed as well. No unclassified candidate was executed.
+
+Reproduce with `python3 runtime-spike/scripts/probe_worker_substitution.py --image sha256:IMAGE_ID --docker-host unix:///PATH/TO/docker.sock` against a trusted local synthetic worker image. The script creates and deletes its own temporary container and image. This confirms that a full caller-selected image ID plus matching configuration does not establish worker identity. Before container output could support ordinary replay or promotion, the execution path needs an independently supplied trusted worker or image identity and fail-closed verification, with a clear trust model for the Docker daemon and host. A hash supplied by the same untrusted image or daemon would not by itself establish origin.
