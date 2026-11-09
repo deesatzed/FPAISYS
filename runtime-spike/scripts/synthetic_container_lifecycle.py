@@ -559,6 +559,46 @@ def _configuration_matches(output, container_id, image, name, *, require_worker_
         return False
 
 
+def _exchange_with_deadline(proc, request, deadline):
+    """Send a bounded request while draining output without blocking the deadline."""
+    output = bytearray()
+    sent = 0
+    os.set_blocking(proc.stdin.fileno(), False)
+    os.set_blocking(proc.stdout.fileno(), False)
+    with selectors.DefaultSelector() as selector:
+        selector.register(proc.stdin, selectors.EVENT_WRITE)
+        selector.register(proc.stdout, selectors.EVENT_READ)
+        eof = False
+        while not (eof and proc.poll() is not None and sent == len(request)):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("container deadline exceeded")
+            for key, _ in selector.select(min(remaining, 0.05)):
+                if key.fileobj is proc.stdin:
+                    try:
+                        sent += os.write(key.fd, request[sent:])
+                    except BlockingIOError:
+                        continue
+                    if sent == len(request):
+                        selector.unregister(proc.stdin)
+                        proc.stdin.close()
+                else:
+                    try:
+                        chunk = os.read(key.fd, 17 - len(output))
+                    except BlockingIOError:
+                        continue
+                    if not chunk:
+                        selector.unregister(proc.stdout)
+                        eof = True
+                    else:
+                        output.extend(chunk)
+                        if len(output) > 16:
+                            raise RuntimeError("container response exceeds 16 bytes")
+        if proc.returncode != 0:
+            raise RuntimeError("container worker failed")
+    return output
+
+
 def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate, event, window, request, artifact, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False, expected_worker_sha256=None):
     """Run a built-in synthetic candidate; return only after verified cleanup."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
@@ -625,30 +665,7 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
         if time.monotonic() >= deadline:
             raise RuntimeError("container deadline exceeded")
         proc = subprocess.Popen([docker, "--host", host, "start", "--attach", "--interactive", container_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())
-        proc.stdin.write(request)
-        proc.stdin.close()
-        os.set_blocking(proc.stdout.fileno(), False)
-        with selectors.DefaultSelector() as selector:
-            selector.register(proc.stdout, selectors.EVENT_READ)
-            eof = False
-            while not (eof and proc.poll() is not None):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise RuntimeError("container deadline exceeded")
-                if not eof:
-                    for key, _ in selector.select(min(remaining, 0.05)):
-                        chunk = os.read(key.fd, 17 - len(output))
-                        if not chunk:
-                            selector.unregister(proc.stdout)
-                            eof = True
-                            break
-                        output.extend(chunk)
-                        if len(output) > 16:
-                            raise RuntimeError("container response exceeds 16 bytes")
-                else:
-                    time.sleep(min(remaining, 0.01))
-        if proc.returncode != 0:
-            raise RuntimeError("container worker failed")
+        output = _exchange_with_deadline(proc, request, deadline)
         if len(output) != 16:
             raise RuntimeError("invalid container response length")
         verdict = struct.unpack("<IdI", output)
@@ -665,6 +682,8 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
                 error = "Docker client termination unconfirmed"
         if proc is not None and proc.stdout is not None:
             proc.stdout.close()
+        if proc is not None and proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
         if container_id is None:
             error = f"container creation or cleanup unconfirmed; probe name {name}"
         elif _daemon_id(docker, host) != daemon_id:

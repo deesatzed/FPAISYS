@@ -177,3 +177,5 @@ Require `event-pin` to receive `replay:<ID>` instead of a bare number. This CLI 
 Disable image-inherited Docker health checks for synthetic container runs and require the pre-start inspection to report `Healthcheck.Test` as `["NONE"]`. This excludes an extra image-specified process under the reported configuration, but does not authenticate Docker, the image, the worker, or the host and does not authorize untrusted execution.
 
 Include existing training-trace binding verification in `--verify-event-cycle`. Keep overall `evidence_bindings_checked` false: trace bindings alone do not verify signatures, authority custody, source or outcome truth, or all evidence classes. Use the cycle option in both operator walkthroughs so its current-head requirement also applies to their independent verification.
+
+Send container requests and drain responses using nonblocking pipes under the same monotonic deadline. This prevents a worker that stops reading a larger future request from indefinitely blocking the bridge. It does not change the built-in-only execution policy or guarantee cleanup when the daemon is unavailable.

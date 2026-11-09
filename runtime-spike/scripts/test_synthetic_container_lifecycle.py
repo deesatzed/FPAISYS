@@ -34,6 +34,45 @@ class ContainerLifecycleTests(unittest.TestCase):
         record.update(schema="sese-synthetic-container-intent-v4", state="pending")
         path.write_text(json.dumps(record))
 
+    def test_large_request_to_nonreading_worker_obeys_deadline(self):
+        import synthetic_container_lifecycle as lifecycle
+        self.assertTrue(hasattr(lifecycle, "_exchange_with_deadline"))
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        start = time.monotonic()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "deadline exceeded"):
+                lifecycle._exchange_with_deadline(proc, b"x" * 131072, start + 0.3)
+            self.assertLess(time.monotonic() - start, 2)
+        finally:
+            proc.kill()
+            proc.wait(timeout=5)
+            proc.stdin.close()
+            proc.stdout.close()
+
+    def test_exchange_delivers_large_request_and_rejects_output_flood(self):
+        from synthetic_container_lifecycle import _exchange_with_deadline
+        for program, expected in [
+            ("import sys; d=sys.stdin.buffer.read(); sys.stdout.buffer.write(len(d).to_bytes(16,'little'))", False),
+            ("import sys; sys.stdout.buffer.write(b'x'*17); sys.stdout.buffer.flush(); sys.stdin.buffer.read()", True),
+        ]:
+            with self.subTest(flood=expected):
+                proc = subprocess.Popen([sys.executable, "-c", program], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+                try:
+                    if expected:
+                        with self.assertRaisesRegex(RuntimeError, "response exceeds 16 bytes"):
+                            _exchange_with_deadline(proc, b"x" * 131072, time.monotonic() + 3)
+                    else:
+                        output = _exchange_with_deadline(proc, b"x" * 131072, time.monotonic() + 3)
+                        self.assertEqual(int.from_bytes(output, "little"), 131072)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                    proc.wait(timeout=5)
+                    if not proc.stdin.closed:
+                        proc.stdin.close()
+                    proc.stdout.close()
+
     def test_original_request_reaches_lifecycle_only_if_it_matches_fixed_candidate(self):
         import synthetic_container_lifecycle as lifecycle
         request, artifact = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
