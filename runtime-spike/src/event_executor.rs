@@ -57,6 +57,33 @@ pub struct SyntheticContainerResult {
     pub receipt_json: String,
 }
 
+#[cfg(unix)]
+fn valid_receipt_worker_pin(
+    raw: &[u8],
+    schema: &str,
+    pin: Option<&str>,
+    status: Option<&str>,
+) -> bool {
+    let value: serde_json::Value = match serde_json::from_slice(raw) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    match schema {
+        "sese-synthetic-container-intent-v4" => {
+            value.get("expected_worker_sha256").is_none()
+                && value.get("worker_pin_status").is_none()
+        }
+        "sese-synthetic-container-intent-v5" => {
+            pin.is_some_and(|p| {
+                p.len() == 64
+                    && p.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            }) && status == Some("matched")
+        }
+        _ => false,
+    }
+}
+
 /// Check retained receipt bytes against the exact fixed-artifact request and verdict.
 /// This verifies consistency, not historical permissions or execution authenticity.
 #[cfg(unix)]
@@ -86,6 +113,10 @@ pub(crate) fn verify_captured_receipt(
         container_id: String,
         result_status: String,
         output_sha256: String,
+        #[serde(default)]
+        expected_worker_sha256: Option<String>,
+        #[serde(default)]
+        worker_pin_status: Option<String>,
     }
     let hex = |s: &str, n: usize| {
         s.len() == n
@@ -122,7 +153,12 @@ pub(crate) fn verify_captured_receipt(
         || host
             .bytes()
             .any(|b| matches!(b, 0 | b'\n' | b'\r' | b'?' | b'#' | b'%'))
-        || r.schema != "sese-synthetic-container-intent-v4"
+        || !valid_receipt_worker_pin(
+            raw.as_bytes(),
+            &r.schema,
+            r.expected_worker_sha256.as_deref(),
+            r.worker_pin_status.as_deref(),
+        )
         || r.state != "removed"
         || r.result_status != "valid_verdict"
         || r.image != image
@@ -303,6 +339,10 @@ impl SyntheticContainerExecutor {
             container_id: String,
             result_status: String,
             output_sha256: String,
+            #[serde(default)]
+            expected_worker_sha256: Option<String>,
+            #[serde(default)]
+            worker_pin_status: Option<String>,
         }
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -349,7 +389,12 @@ impl SyntheticContainerExecutor {
                 && s.bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
-        if r.schema != "sese-synthetic-container-intent-v4"
+        if !valid_receipt_worker_pin(
+            &bytes,
+            &r.schema,
+            r.expected_worker_sha256.as_deref(),
+            r.worker_pin_status.as_deref(),
+        ) || r.expected_worker_sha256 != self.worker_pin
             || r.name != name
             || r.image != self.image
             || r.docker_host != self.host
@@ -379,5 +424,55 @@ impl SyntheticContainerExecutor {
             receipt_path: path,
             receipt_json,
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod worker_pin_receipt_tests {
+    use super::valid_receipt_worker_pin;
+
+    #[test]
+    fn rejects_incomplete_or_mislabelled_pin_records() {
+        let pin = "a".repeat(64);
+        let v4 = br#"{"schema":"sese-synthetic-container-intent-v4"}"#;
+        assert!(valid_receipt_worker_pin(
+            v4,
+            "sese-synthetic-container-intent-v4",
+            None,
+            None
+        ));
+        let polluted =
+            br#"{"schema":"sese-synthetic-container-intent-v4","worker_pin_status":null}"#;
+        assert!(!valid_receipt_worker_pin(
+            polluted,
+            "sese-synthetic-container-intent-v4",
+            None,
+            None
+        ));
+        let v5 = br#"{"schema":"sese-synthetic-container-intent-v5"}"#;
+        assert!(valid_receipt_worker_pin(
+            v5,
+            "sese-synthetic-container-intent-v5",
+            Some(&pin),
+            Some("matched")
+        ));
+        assert!(!valid_receipt_worker_pin(
+            v5,
+            "sese-synthetic-container-intent-v5",
+            Some(&pin),
+            Some("unconfirmed")
+        ));
+        assert!(!valid_receipt_worker_pin(
+            v5,
+            "sese-synthetic-container-intent-v5",
+            Some("bad"),
+            Some("matched")
+        ));
+        assert!(!valid_receipt_worker_pin(
+            v5,
+            "sese-synthetic-container-intent-v5",
+            None,
+            Some("matched")
+        ));
     }
 }

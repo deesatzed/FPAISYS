@@ -29,6 +29,17 @@ class ReviewComparisonTests(unittest.TestCase):
                      "receipt_path": str(path), "actual": {"decision": 1, "score": 3.0, "reason": 4}}
             verify_receipts([(entry, event, window)], receipt["image"], receipt["docker_host"])
             verify_receipts([(entry, event, window)], receipt["image"], receipt["docker_host"], snapshots=[path.read_text()])
+            receipt.update(schema="sese-synthetic-container-intent-v5", expected_worker_sha256="f" * 64, worker_pin_status="matched")
+            path.write_text(json.dumps(receipt))
+            verify_receipts([(entry, event, window)], receipt["image"], receipt["docker_host"])
+            receipt["worker_pin_status"] = "unconfirmed"
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, "receipt"):
+                verify_receipts([(entry, event, window)], receipt["image"], receipt["docker_host"])
+            receipt.update(schema="sese-synthetic-container-intent-v4")
+            del receipt["expected_worker_sha256"]
+            del receipt["worker_pin_status"]
+            path.write_text(json.dumps(receipt))
             with self.assertRaisesRegex(ValueError, "receipt"):
                 verify_receipts([(entry, event, window), (entry, event, window)], receipt["image"], receipt["docker_host"])
             second = dict(receipt, name="sese-synthetic-" + "d" * 32, container_id="e" * 64, daemon_id="other-daemon")

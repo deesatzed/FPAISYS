@@ -935,12 +935,20 @@ fn pinned_container_worker_checks_bytes_before_synthetic_execution() {
     .unwrap();
     assert_eq!(receipt["state"], "removed");
     assert_eq!(receipt["result_status"], "failed");
+    assert_eq!(receipt["schema"], "sese-synthetic-container-intent-v5");
+    assert_eq!(receipt["expected_worker_sha256"], "0".repeat(64));
+    assert_eq!(receipt["worker_pin_status"], "unconfirmed");
     let result = make()
         .with_worker_pin(&pin)
         .unwrap()
         .execute(&artifact, &window, &event, Duration::from_secs(40))
         .unwrap();
     assert_eq!(result.verdict.score, 3.5);
+    let pinned: serde_json::Value = serde_json::from_str(&result.receipt_json).unwrap();
+    assert_eq!(pinned["schema"], "sese-synthetic-container-intent-v5");
+    assert_eq!(pinned["expected_worker_sha256"], pin);
+    assert_eq!(pinned["worker_pin_status"], "matched");
+
     let db = dir.join("app.db");
     let cli = env!("CARGO_BIN_EXE_sese-outcome");
     let init = std::process::Command::new(cli)

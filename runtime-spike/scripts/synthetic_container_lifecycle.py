@@ -185,21 +185,27 @@ def inspect_pending(receipt_path, *, docker="docker"):
     version = record.get("schema")
     legacy = version in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2")
     expected_fields = {"schema", "name", "image", "state"}
-    if version in ("sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
+    if version in ("sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5", "sese-synthetic-container-preflight-v1"):
         expected_fields.add("daemon_id")
-    if version in ("sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
+    if version in ("sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5", "sese-synthetic-container-preflight-v1"):
         expected_fields.add("docker_host")
-    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
+    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5", "sese-synthetic-container-preflight-v1"):
         expected_fields.update(("candidate", "artifact_sha256", "request_sha256"))
+    if version == "sese-synthetic-container-intent-v5":
+        expected_fields.update(("expected_worker_sha256", "worker_pin_status"))
+        if (not isinstance(record.get("expected_worker_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["expected_worker_sha256"])
+                or record.get("worker_pin_status") != "unconfirmed"):
+            raise ValueError("invalid pending worker pin")
     if set(record) != expected_fields:
         raise ValueError("invalid pending receipt fields")
     name, image = record["name"], record["image"]
-    if (version not in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1") or record["state"] != ("not_created" if version == "sese-synthetic-container-preflight-v1" else "pending")
+    if (version not in ("sese-synthetic-container-intent-v1", "sese-synthetic-container-intent-v2", "sese-synthetic-container-intent-v3", "sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5", "sese-synthetic-container-preflight-v1") or record["state"] != ("not_created" if version == "sese-synthetic-container-preflight-v1" else "pending")
             or not isinstance(name, str) or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", name)
             or path.name != name + ".json" or not isinstance(image, str)
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", image)):
         raise ValueError("invalid pending receipt")
-    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-preflight-v1"):
+    if version in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5", "sese-synthetic-container-preflight-v1"):
         _, artifact = _synthetic_request(record["candidate"], (1, 42, 3.0, 4), (0, 0.0, 0, 0))
         if (record["artifact_sha256"] != hashlib.sha256(artifact).hexdigest()
                 or not isinstance(record["request_sha256"], str)
@@ -280,7 +286,7 @@ def recover_pending(receipt_path, *, container_id, daemon_id, docker_host, image
                 or observed.get("daemon_id") != daemon_id or observed.get("image") != image):
             raise ValueError("recovery identity mismatch or container observation unknown")
         record = json.loads(raw)
-        if record.get("schema") != "sese-synthetic-container-intent-v4" or record.get("docker_host") != host:
+        if record.get("schema") not in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5") or record.get("docker_host") != host:
             raise ValueError("recovery identity mismatch: endpoint or receipt version")
         read_receipt()
         recovery_path = directory / (".sese-recovery-" + uuid.uuid4().hex + ".json")
@@ -461,7 +467,14 @@ def _check_journal(directory_fd):
                     raise ValueError("invalid preflight artifact")
                 continue
             fields = {"schema", "name", "image", "state", "daemon_id", "docker_host", "candidate", "artifact_sha256", "request_sha256", "container_id", "result_status", "output_sha256"}
-            if not isinstance(receipt, dict) or set(receipt) != fields or receipt["schema"] != "sese-synthetic-container-intent-v4" or receipt["state"] != "removed" or receipt["name"] + ".json" != filename:
+            if isinstance(receipt, dict) and receipt.get("schema") == "sese-synthetic-container-intent-v5":
+                fields.update(("expected_worker_sha256", "worker_pin_status"))
+                if (not isinstance(receipt.get("expected_worker_sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", receipt["expected_worker_sha256"])
+                        or receipt.get("worker_pin_status") not in ("matched", "unconfirmed")
+                        or (receipt.get("result_status") == "valid_verdict" and receipt.get("worker_pin_status") != "matched")):
+                    raise ValueError("invalid worker pin record")
+            if not isinstance(receipt, dict) or set(receipt) != fields or receipt["schema"] not in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5") or receipt["state"] != "removed" or receipt["name"] + ".json" != filename:
                 raise ValueError("receipt not confirmed removed")
             if (not isinstance(receipt["image"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["image"])
                     or not isinstance(receipt["daemon_id"], str) or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,128}", receipt["daemon_id"])
@@ -578,6 +591,8 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
     if _daemon_id(docker, host, deadline=deadline) != daemon_id:
         raise RuntimeError(f"Docker daemon changed before launch; receipt_path={receipt_path}")
     receipt.update(schema="sese-synthetic-container-intent-v4", state="pending", daemon_id=daemon_id)
+    if expected_worker_sha256 is not None:
+        receipt.update(schema="sese-synthetic-container-intent-v5", expected_worker_sha256=expected_worker_sha256, worker_pin_status="unconfirmed")
     _write_receipt(receipt_path, receipt, create=False)
     container_id = None
     output = bytearray()
@@ -605,6 +620,7 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
                                    limit=16 * 1024 * 1024 + 65536, deadline=deadline, binary=True)
             if not _worker_archive_matches(archive, expected_worker_sha256) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
                 raise RuntimeError("container worker pin unconfirmed or mismatched")
+            receipt["worker_pin_status"] = "matched"
         if time.monotonic() >= deadline:
             raise RuntimeError("container deadline exceeded")
         proc = subprocess.Popen([docker, "--host", host, "start", "--attach", "--interactive", container_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())

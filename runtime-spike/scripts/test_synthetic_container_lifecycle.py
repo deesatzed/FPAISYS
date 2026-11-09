@@ -74,6 +74,34 @@ class ContainerLifecycleTests(unittest.TestCase):
         self.assertFalse(_worker_archive_matches(archive([("event-worker", payload, False), ("extra", payload, False)]), pin))
         self.assertFalse(_worker_archive_matches(good[:100], pin))
 
+    def test_pinned_pending_and_removed_receipts_keep_conservative_status(self):
+        from synthetic_container_lifecycle import _check_journal
+        name = "sese-synthetic-" + "a" * 32
+        path = Path(self.journal_dir) / (name + ".json")
+        request, artifact = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+        record = {"schema": "sese-synthetic-container-intent-v5", "name": name,
+                  "image": "sha256:" + "b" * 64, "state": "pending", "daemon_id": "daemon",
+                  "docker_host": self.docker_host, "candidate": "throttle",
+                  "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+                  "request_sha256": hashlib.sha256(request).hexdigest(),
+                  "expected_worker_sha256": "c" * 64, "worker_pin_status": "unconfirmed"}
+        path.write_text(json.dumps(record)); path.chmod(0o600)
+        self.assertEqual(inspect_pending(path)["status"], "unknown")
+        directory = os.open(self.journal_dir, os.O_RDONLY)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                _check_journal(directory)
+            record.update(state="removed", container_id="d" * 64, result_status="failed", output_sha256=None)
+            path.write_text(json.dumps(record)); _check_journal(directory)
+            record.update(result_status="valid_verdict", output_sha256="e" * 64)
+            path.write_text(json.dumps(record))
+            with self.assertRaisesRegex(RuntimeError, "unresolved"):
+                _check_journal(directory)
+            record["worker_pin_status"] = "matched"
+            path.write_text(json.dumps(record)); _check_journal(directory)
+        finally:
+            os.close(directory)
+
     def test_invalid_worker_pin_is_rejected_before_container_work(self):
         with self.assertRaisesRegex(ValueError, "worker pin"):
             run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
@@ -644,11 +672,16 @@ class ContainerLifecycleTests(unittest.TestCase):
         container_id = None
         try:
             with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed") as caught:
-                run_synthetic(image, timeout=15, docker=str(wrapper), journal_dir=self.journal_dir, docker_host=self.docker_host)
+                run_synthetic(image, timeout=15, docker=str(wrapper), journal_dir=self.journal_dir, docker_host=self.docker_host,
+                              expected_worker_sha256=os.environ.get("SESE_TEST_WORKER_SHA256"))
             container_id = re.search(r"container_id=([0-9a-f]{64})(?:;|$)", str(caught.exception)).group(1)
             receipt = next(Path(self.journal_dir).glob("sese-synthetic-*.json"))
             observed = inspect_pending(receipt, docker=actual_docker)
             self.assertEqual(observed["container_id"], container_id)
+            if os.environ.get("SESE_TEST_WORKER_SHA256"):
+                pending = json.loads(receipt.read_text())
+                self.assertEqual(pending["schema"], "sese-synthetic-container-intent-v5")
+                self.assertEqual(pending["worker_pin_status"], "unconfirmed")
             before = receipt.read_bytes()
             expected_hash = hashlib.sha256(before).hexdigest()
             inspection = subprocess.run([sys.executable, str(Path(__file__).parent / "synthetic_container_recover.py"), str(receipt), "--inspect-only", "--docker", actual_docker], capture_output=True, text=True, timeout=15)
@@ -686,6 +719,9 @@ class ContainerLifecycleTests(unittest.TestCase):
             saved = json.loads(receipt.read_text())
             self.assertEqual(saved["state"], "removed")
             self.assertEqual(saved["result_status"], "failed")
+            if os.environ.get("SESE_TEST_WORKER_SHA256"):
+                self.assertEqual(saved["worker_pin_status"], "unconfirmed")
+                self.assertEqual(saved["expected_worker_sha256"], os.environ["SESE_TEST_WORKER_SHA256"])
             audit = json.loads(Path(result["recovery_path"]).read_text())
             self.assertEqual(audit["actor"], "test-operator")
             self.assertEqual(audit["status"], "completed")

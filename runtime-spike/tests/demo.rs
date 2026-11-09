@@ -99,6 +99,17 @@ fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step
     }
     let combined: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(combined["promotion_evidence"], false);
+    if let Some(pin) = &pin {
+        for raw in [
+            &combined["container_replay"]["cases"][0]["receipt"],
+            &combined["container_shadow"]["champion"]["receipt"],
+            &combined["container_shadow"]["shadow"]["receipt"],
+        ] {
+            let receipt: serde_json::Value = serde_json::from_str(raw.as_str().unwrap()).unwrap();
+            assert_eq!(receipt["expected_worker_sha256"], *pin);
+            assert_eq!(receipt["worker_pin_status"], "matched");
+        }
+    }
     assert_eq!(combined["prepared"]["checkpoint"], combined["checkpoint"]);
     let fresh = dir.join("comparison.json");
     std::fs::write(&fresh, result.stdout).unwrap();

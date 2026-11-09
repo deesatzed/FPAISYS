@@ -46,8 +46,15 @@ def verify_receipts(entries, image, host, *, snapshots=None):
             actual = entry["actual"]
             output = struct.pack("<IdI", actual["decision"], actual["score"], actual["reason"])
             name, container = receipt["name"], receipt["container_id"]
-            if (set(receipt) != {"schema", "name", "image", "state", "daemon_id", "docker_host", "candidate", "artifact_sha256", "request_sha256", "container_id", "result_status", "output_sha256"}
-                    or receipt["schema"] != "sese-synthetic-container-intent-v4" or receipt["state"] != "removed"
+            fields = {"schema", "name", "image", "state", "daemon_id", "docker_host", "candidate", "artifact_sha256", "request_sha256", "container_id", "result_status", "output_sha256"}
+            if receipt.get("schema") == "sese-synthetic-container-intent-v5":
+                fields.update(("expected_worker_sha256", "worker_pin_status"))
+                if (not isinstance(receipt.get("expected_worker_sha256"), str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", receipt["expected_worker_sha256"])
+                        or receipt.get("worker_pin_status") != "matched"):
+                    raise ValueError("invalid worker pin record")
+            if (set(receipt) != fields
+                    or receipt["schema"] not in ("sese-synthetic-container-intent-v4", "sese-synthetic-container-intent-v5") or receipt["state"] != "removed"
                     or receipt["result_status"] != "valid_verdict" or receipt["image"] != image or receipt["docker_host"] != host
                     or not isinstance(receipt["daemon_id"], str) or not re.fullmatch(r"[A-Za-z0-9:_.-]{1,128}", receipt["daemon_id"])
                     or (daemon_id is not None and daemon_id != receipt["daemon_id"])
