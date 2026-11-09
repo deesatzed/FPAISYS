@@ -99,6 +99,13 @@ fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step
     }
     let combined: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(combined["promotion_evidence"], false);
+    assert_eq!(combined["worker_pin_summary"]["receipt_count"], 3);
+    assert_eq!(combined["worker_pin_summary"]["origin_verified"], false);
+    if pin.is_some() {
+        assert_eq!(combined["worker_pin_summary"]["status"], "consistent");
+    } else {
+        assert_eq!(combined["worker_pin_summary"]["status"], "unpinned");
+    }
     if let Some(pin) = &pin {
         for raw in [
             &combined["container_replay"]["cases"][0]["receipt"],

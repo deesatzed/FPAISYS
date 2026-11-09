@@ -1813,7 +1813,9 @@ impl Storage {
             observation,
             &current,
         )?;
-        let result = serde_json::json!({"schema":"sese-container-review-preview-v1","matched":true,"domain":domain,"application_replay_id":replay,"application_observation_id":observation,"container_replay_seq":container_replay_seq,"container_shadow_seq":container_shadow_seq,"container_comparison_seq":container_shadow_seq,"container_comparison_kind":shadow_kind,"review":preview,"container_replay":container_replay,"container_shadow":shadow,"checkpoint":preview["checkpoint"],"synthetic":true,"execution_authenticated":false,"promotion_evidence":false});
+        let worker_pin_summary =
+            crate::container_review::worker_pin_summary(&container_replay, &shadow)?;
+        let result = serde_json::json!({"schema":"sese-container-review-preview-v1","matched":true,"worker_pin_summary":worker_pin_summary,"domain":domain,"application_replay_id":replay,"application_observation_id":observation,"container_replay_seq":container_replay_seq,"container_shadow_seq":container_shadow_seq,"container_comparison_seq":container_shadow_seq,"container_comparison_kind":shadow_kind,"review":preview,"container_replay":container_replay,"container_shadow":shadow,"checkpoint":preview["checkpoint"],"synthetic":true,"execution_authenticated":false,"promotion_evidence":false});
         tx.commit().map_err(|e| e.to_string())?;
         Ok(result)
     }

@@ -863,6 +863,7 @@ fn operator_can_compare_stored_container_evidence_in_a_read_only_snapshot() {
         )
         .unwrap();
     assert_eq!(preview["matched"], true);
+    assert_eq!(preview["worker_pin_summary"]["status"], "unpinned");
     assert_eq!(preview["promotion_evidence"], false);
     assert_eq!(preview["execution_authenticated"], false);
     assert_eq!(preview["checkpoint"]["seq"], checkpoint.0);
@@ -901,9 +902,29 @@ fn operator_can_compare_stored_container_evidence_in_a_read_only_snapshot() {
         )
         .unwrap();
     assert_eq!(different_observation.prior.count, 1);
+    let pinned_executor = if let Ok(pin) = std::env::var("SESE_TEST_WORKER_SHA256") {
+        Some(
+            SyntheticContainerExecutor::new(
+                "/opt/homebrew/bin/python3",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/synthetic_container_worker.py"
+                ),
+                "/usr/local/bin/docker",
+                &image,
+                &host,
+                journal.to_str().unwrap(),
+            )
+            .unwrap()
+            .with_worker_pin(&pin)
+            .unwrap(),
+        )
+    } else {
+        None
+    };
     let historical = sese_runtime_spike::event_host::compare_container_observation(
         &mut db,
-        &executor,
+        pinned_executor.as_ref().unwrap_or(&executor),
         "domain",
         different_observation.id,
         Duration::from_secs(40),
@@ -925,6 +946,20 @@ fn operator_can_compare_stored_container_evidence_in_a_read_only_snapshot() {
         )
         .unwrap();
     assert_eq!(historical_preview["matched"], true);
+    if pinned_executor.is_some() {
+        assert_eq!(
+            historical_preview["worker_pin_summary"]["status"],
+            "partially_pinned"
+        );
+        assert_eq!(
+            historical_preview["worker_pin_summary"]["unpinned_count"],
+            1
+        );
+        assert_eq!(
+            historical_preview["worker_pin_summary"]["origin_verified"],
+            false
+        );
+    }
     assert_eq!(
         historical_preview["container_comparison_kind"],
         "container_observation_experiment"

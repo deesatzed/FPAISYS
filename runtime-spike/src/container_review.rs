@@ -2,6 +2,71 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Summarize caller-asserted worker pins from already validated successful receipts.
+/// Matching pins are not evidence of a trusted digest source or daemon.
+pub(crate) fn worker_pin_summary(replay: &Value, shadow: &Value) -> Result<Value, String> {
+    let mut pins = Vec::new();
+    let cases = replay["cases"]
+        .as_array()
+        .ok_or("missing container cases")?;
+    for case in cases {
+        pins.push(
+            case["receipt"]
+                .as_str()
+                .ok_or("missing container receipt")?,
+        );
+    }
+    for role in ["champion", "shadow"] {
+        pins.push(
+            shadow[role]["receipt"]
+                .as_str()
+                .ok_or("missing container receipt")?,
+        );
+    }
+    let mut distinct = HashSet::new();
+    let mut unpinned = 0usize;
+    for raw in &pins {
+        let receipt: Value = serde_json::from_str(raw).map_err(|_| "invalid container receipt")?;
+        match receipt["schema"].as_str() {
+            Some("sese-synthetic-container-intent-v4") => unpinned += 1,
+            Some("sese-synthetic-container-intent-v5")
+                if receipt["worker_pin_status"] == "matched" =>
+            {
+                let pin = receipt["expected_worker_sha256"]
+                    .as_str()
+                    .ok_or("invalid worker pin")?;
+                if pin.len() != 64
+                    || !pin
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                {
+                    return Err("invalid worker pin".into());
+                }
+                distinct.insert(pin.to_owned());
+            }
+            _ => return Err("invalid worker pin receipt".into()),
+        }
+    }
+    let status = if unpinned == pins.len() {
+        "unpinned"
+    } else if distinct.len() > 1 {
+        "different_pins"
+    } else if unpinned > 0 {
+        "partially_pinned"
+    } else {
+        "consistent"
+    };
+    let pin = if status == "consistent" {
+        distinct.into_iter().next()
+    } else {
+        None
+    };
+    Ok(
+        serde_json::json!({"status":status,"receipt_count":pins.len(),"unpinned_count":unpinned,
+        "expected_worker_sha256":pin,"origin_verified":false,"execution_authenticated":false}),
+    )
+}
+
 fn bits(v: &Value) -> Result<f64, String> {
     let s = v.as_str().ok_or("invalid float bits")?;
     if s.len() != 16
@@ -169,6 +234,37 @@ pub(crate) fn compare(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pin_summary_distinguishes_missing_and_disagreeing_receipts() {
+        let old = serde_json::json!({"schema":"sese-synthetic-container-intent-v4"}).to_string();
+        let pinned = |c: char| {
+            serde_json::json!({"schema":"sese-synthetic-container-intent-v5", "expected_worker_sha256":c.to_string().repeat(64), "worker_pin_status":"matched"}).to_string()
+        };
+        let one = pinned('a');
+        let two = pinned('b');
+        let build = |case: &str, champion: &str, shadow: &str| {
+            (
+                serde_json::json!({"cases":[{"receipt":case}]}),
+                serde_json::json!({"champion":{"receipt":champion},"shadow":{"receipt":shadow}}),
+            )
+        };
+        for (case, champion, shadow, expected) in [
+            (&old, &old, &old, "unpinned"),
+            (&one, &one, &one, "consistent"),
+            (&one, &old, &one, "partially_pinned"),
+            (&one, &two, &one, "different_pins"),
+        ] {
+            let (replay, shadow) = build(case, champion, shadow);
+            let value = worker_pin_summary(&replay, &shadow).unwrap();
+            assert_eq!(value["status"], expected);
+            assert_eq!(value["receipt_count"], 3);
+            assert_eq!(value["origin_verified"], false);
+        }
+        let bad = serde_json::json!({"schema":"sese-synthetic-container-intent-v5", "expected_worker_sha256":"a".repeat(64), "worker_pin_status":"unconfirmed"}).to_string();
+        let (replay, shadow) = build(&bad, &one, &one);
+        assert!(worker_pin_summary(&replay, &shadow).is_err());
+    }
 
     // This exercises comparison logic only; the surrounding storage layer verifies receipts.
     #[test]
