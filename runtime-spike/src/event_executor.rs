@@ -47,6 +47,7 @@ pub struct SyntheticContainerExecutor {
     image: String,
     host: String,
     journal: std::path::PathBuf,
+    worker_pin: Option<String>,
 }
 
 #[cfg(unix)]
@@ -199,7 +200,22 @@ impl SyntheticContainerExecutor {
             image: image.into(),
             host: host.into(),
             journal,
+            worker_pin: None,
         })
+    }
+
+    /// Add a caller-supplied worker digest to the experimental pre-start check.
+    /// Its trust depends on the digest source and Docker daemon.
+    pub fn with_worker_pin(mut self, pin: &str) -> Result<Self, String> {
+        if pin.len() != 64
+            || !pin
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid worker pin".into());
+        }
+        self.worker_pin = Some(pin.to_owned());
+        Ok(self)
     }
 
     pub(crate) fn verify_helpers(&self) -> Result<(), String> {
@@ -245,7 +261,7 @@ impl SyntheticContainerExecutor {
         let path = self.journal.join(format!("{name}.json"));
         let journal = self.journal.to_str().ok_or("invalid journal path")?;
         let inner_timeout = timeout.as_secs_f64().min(60.0).to_string();
-        let args = [
+        let mut args = vec![
             "-B",
             self.bridge.path.as_str(),
             self.image.as_str(),
@@ -255,6 +271,9 @@ impl SyntheticContainerExecutor {
             name.as_str(),
             inner_timeout.as_str(),
         ];
+        if let Some(pin) = &self.worker_pin {
+            args.push(pin.as_str());
+        }
         let output = crate::supervise_request_with_args(
             &self.python.path,
             &args,

@@ -1,4 +1,6 @@
 import os
+import io
+import tarfile
 import json
 import hashlib
 import fcntl
@@ -46,6 +48,37 @@ class ContainerLifecycleTests(unittest.TestCase):
                 run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
                               docker_host=self.docker_host, request_bytes=bytearray(request))
             self.assertEqual(execute.call_count, 1)
+
+    def test_worker_archive_pin_rejects_tampering_links_and_extra_files(self):
+        from synthetic_container_lifecycle import _worker_archive_matches
+        payload = b"known synthetic worker"
+        pin = hashlib.sha256(payload).hexdigest()
+        def archive(entries):
+            out = io.BytesIO()
+            with tarfile.open(fileobj=out, mode="w") as tar:
+                for name, data, link in entries:
+                    info = tarfile.TarInfo(name)
+                    if link:
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = "elsewhere"
+                        tar.addfile(info)
+                    else:
+                        info.size = len(data)
+                        tar.addfile(info, io.BytesIO(data))
+            return out.getvalue()
+        good = archive([("event-worker", payload, False)])
+        self.assertTrue(_worker_archive_matches(good, pin))
+        self.assertFalse(_worker_archive_matches(good, "0" * 64))
+        self.assertFalse(_worker_archive_matches(archive([("other", payload, False)]), pin))
+        self.assertFalse(_worker_archive_matches(archive([("event-worker", payload, True)]), pin))
+        self.assertFalse(_worker_archive_matches(archive([("event-worker", payload, False), ("extra", payload, False)]), pin))
+        self.assertFalse(_worker_archive_matches(good[:100], pin))
+
+    def test_invalid_worker_pin_is_rejected_before_container_work(self):
+        with self.assertRaisesRegex(ValueError, "worker pin"):
+            run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
+                          docker_host=self.docker_host, expected_worker_sha256="not-a-digest")
+        self.assertEqual(list(Path(self.journal_dir).iterdir()), [])
 
     def test_internal_lifecycle_rejects_untrusted_request_before_any_container_work(self):
         import synthetic_container_lifecycle as lifecycle

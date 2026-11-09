@@ -6,9 +6,10 @@ from synthetic_container_lifecycle import SYNTHETIC_CANDIDATES, _synthetic_reque
 
 
 def run():
-    if len(sys.argv) != 7:
+    if len(sys.argv) not in (7, 8):
         raise ValueError("invalid synthetic container worker arguments")
-    image, host, journal, docker, name, timeout = sys.argv[1:]
+    image, host, journal, docker, name, timeout = sys.argv[1:7]
+    pin = sys.argv[7] if len(sys.argv) == 8 else None
     data = sys.stdin.buffer.read(65_593)
     if len(data) < 56 or len(data) > 65_592:
         raise ValueError("invalid request length")
@@ -24,7 +25,7 @@ def run():
         raise ValueError("unknown synthetic artifact")
     result = run_synthetic(image, docker_host=host, journal_dir=journal, docker=docker,
                            candidate=candidate, event=event, window=window, timeout=float(timeout), probe_name=name,
-                           require_worker_profile=True, request_bytes=data)
+                           require_worker_profile=True, request_bytes=data, expected_worker_sha256=pin)
     sys.stdout.buffer.write(struct.pack("<IdI", *result["verdict"]))
 
 

@@ -4,6 +4,8 @@ The application uses it for non-promotional synthetic experiments. It does not
 attest Docker, the image, the host, or cleanup after a daemon failure.
 """
 import math
+import io
+import tarfile
 import json
 import hashlib
 import fcntl
@@ -70,7 +72,7 @@ def _validate_host(host):
     return host
 
 
-def _docker_read(args, *, limit=4096, deadline=None):
+def _docker_read(args, *, limit=4096, deadline=None, binary=False):
     """Read a bounded Docker response; failures and deadlines are unknown."""
     now = time.monotonic()
     deadline = min(now + 5, deadline) if deadline is not None else now + 5
@@ -104,6 +106,8 @@ def _docker_read(args, *, limit=4096, deadline=None):
                     time.sleep(min(remaining, 0.01))
         if proc.returncode != 0:
             return None
+        if binary:
+            return bytes(output)
         try:
             return output.decode("utf-8").strip()
         except UnicodeDecodeError:
@@ -121,6 +125,26 @@ def _docker_read(args, *, limit=4096, deadline=None):
             except subprocess.TimeoutExpired:
                 pass
         proc.stdout.close()
+
+
+def _worker_archive_matches(archive, expected):
+    """Compare one bounded regular file without extracting it to disk."""
+    if not isinstance(archive, bytes) or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        return False
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
+            members = tar.getmembers()
+            if len(members) != 1 or members[0].name != "event-worker" or not members[0].isfile() or not 0 < members[0].size <= 16 * 1024 * 1024:
+                return False
+            stream = tar.extractfile(members[0])
+            if stream is None:
+                return False
+            digest = hashlib.sha256()
+            while chunk := stream.read(65536):
+                digest.update(chunk)
+            return digest.hexdigest() == expected
+    except (tarfile.TarError, OSError, ValueError, OverflowError):
+        return False
 
 
 def _daemon_id(docker, host, *, deadline=None):
@@ -455,13 +479,15 @@ def _check_journal(directory_fd):
             raise RuntimeError(f"unresolved synthetic container receipt: {filename}") from exc
 
 
-def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False, request_bytes=None):
+def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False, request_bytes=None, expected_worker_sha256=None):
     """Serialize cooperating runs in one journal; unresolved receipts prevent launch."""
     if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
     if not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise ValueError("timeout must be between zero and 60 seconds")
     _validate_host(docker_host)
+    if expected_worker_sha256 is not None and (not isinstance(expected_worker_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_worker_sha256)):
+        raise ValueError("invalid worker pin")
     expected, _ = _synthetic_request(candidate, event, window)
     if request_bytes is None:
         request = expected
@@ -488,7 +514,7 @@ def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", even
                     raise RuntimeError("journal lock deadline exceeded")
                 time.sleep(min(0.02, remaining))
         _check_journal(directory_fd)
-        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, request=request, artifact=artifact, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name, require_worker_profile=require_worker_profile)
+        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, request=request, artifact=artifact, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name, require_worker_profile=require_worker_profile, expected_worker_sha256=expected_worker_sha256)
     finally:
         os.close(directory_fd)
 
@@ -519,7 +545,7 @@ def _configuration_matches(output, container_id, image, name, *, require_worker_
         return False
 
 
-def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate, event, window, request, artifact, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
+def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate, event, window, request, artifact, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False, expected_worker_sha256=None):
     """Run a built-in synthetic candidate; return only after verified cleanup."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
@@ -574,6 +600,11 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
         report = _docker_read([docker, "--host", host, "inspect", "--type", "container", "--format", "{{json .}}", container_id], limit=65536, deadline=deadline)
         if report is None or not _configuration_matches(report, container_id, image, name, require_worker_profile=require_worker_profile) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
             raise RuntimeError("container configuration unconfirmed or mismatched")
+        if expected_worker_sha256 is not None:
+            archive = _docker_read([docker, "--host", host, "cp", container_id + ":/event-worker", "-"],
+                                   limit=16 * 1024 * 1024 + 65536, deadline=deadline, binary=True)
+            if not _worker_archive_matches(archive, expected_worker_sha256) or _daemon_id(docker, host, deadline=deadline) != daemon_id:
+                raise RuntimeError("container worker pin unconfirmed or mismatched")
         if time.monotonic() >= deadline:
             raise RuntimeError("container deadline exceeded")
         proc = subprocess.Popen([docker, "--host", host, "start", "--attach", "--interactive", container_id], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=_docker_env())

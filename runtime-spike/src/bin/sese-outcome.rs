@@ -347,7 +347,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         #[cfg(unix)]
-        "event-container-replay" if args.len() == 11 => {
+        "event-container-replay" if args.len() == 11 || args.len() == 12 => {
             use sha2::{Digest, Sha256};
             let artifact = sese_runtime_spike::builtin_event::artifact(&args[2])?;
             let candidate = format!("{:x}", Sha256::digest(&artifact));
@@ -359,6 +359,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
                 &args[7], &args[9], &args[8], &args[4], &args[5], &args[6],
             )?;
+            let executor = if args.len() == 12 {
+                executor.with_worker_pin(&args[11])?
+            } else {
+                executor
+            };
             let timeout = std::time::Duration::from_secs(args[10].parse()?);
             let report = sese_runtime_spike::event_replay::replay_container_synthetic(
                 &mut db, &executor, &candidate, &pack, timeout,

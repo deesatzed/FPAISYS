@@ -879,3 +879,120 @@ fn container_replay_rejects_a_changed_ledger_snapshot() {
     drop(conn);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn pinned_container_worker_checks_bytes_before_synthetic_execution() {
+    let (image, host, pin) = match (
+        std::env::var("SESE_TEST_IMAGE"),
+        std::env::var("SESE_TEST_DOCKER_HOST"),
+        std::env::var("SESE_TEST_WORKER_SHA256"),
+    ) {
+        (Ok(i), Ok(h), Ok(p)) => (i, h, p),
+        _ => return,
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "sese-worker-pin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let make = || {
+        SyntheticContainerExecutor::new(
+            "/opt/homebrew/bin/python3",
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/synthetic_container_worker.py"
+            ),
+            "/usr/local/bin/docker",
+            &image,
+            &host,
+            dir.to_str().unwrap(),
+        )
+        .unwrap()
+    };
+    assert!(make().with_worker_pin("invalid").is_err());
+    let artifact = sese_runtime_spike::builtin_event::artifact("throttle").unwrap();
+    let (event, window) = request();
+    assert!(make()
+        .with_worker_pin(&"0".repeat(64))
+        .unwrap()
+        .execute(&artifact, &window, &event, Duration::from_secs(40))
+        .is_err());
+    let receipt: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["state"], "removed");
+    assert_eq!(receipt["result_status"], "failed");
+    let result = make()
+        .with_worker_pin(&pin)
+        .unwrap()
+        .execute(&artifact, &window, &event, Duration::from_secs(40))
+        .unwrap();
+    assert_eq!(result.verdict.score, 3.5);
+    let db = dir.join("app.db");
+    let cli = env!("CARGO_BIN_EXE_sese-outcome");
+    let init = std::process::Command::new(cli)
+        .arg("event-init")
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let register = std::process::Command::new(cli)
+        .arg("event-builtin-register")
+        .arg(&db)
+        .arg("throttle")
+        .output()
+        .unwrap();
+    assert!(
+        register.status.success(),
+        "{}",
+        String::from_utf8_lossy(&register.stderr)
+    );
+    let replay = std::process::Command::new(cli)
+        .arg("event-container-replay")
+        .arg(&db)
+        .arg("throttle")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/event-synthetic-v1.json"
+        ))
+        .arg(&image)
+        .arg(&host)
+        .arg(&dir)
+        .arg("/opt/homebrew/bin/python3")
+        .arg("/usr/local/bin/docker")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/synthetic_container_worker.py"
+        ))
+        .arg("40")
+        .arg(&pin)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&replay.stdout).unwrap()["passed"],
+        true
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
