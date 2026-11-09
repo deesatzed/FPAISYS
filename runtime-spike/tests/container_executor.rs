@@ -256,6 +256,33 @@ fn container_replay_is_stored_separately_from_promotion_evidence() {
             .unwrap()["cases"][0]["actual"]["decision"],
         0
     );
+    // A valid wrong verdict must not prevent later cases from running.
+    let mut multi: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/event-synthetic-v1.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut second = multi["cases"][0].clone();
+    second["id"] = serde_json::json!("second");
+    multi["cases"][0]["expected"]["decision"] = serde_json::json!(0);
+    multi["cases"].as_array_mut().unwrap().push(second);
+    let multi = sese_runtime_spike::fixture_file::parse(multi.to_string().as_bytes()).unwrap();
+    let replay = sese_runtime_spike::event_replay::replay_container_synthetic(
+        &mut db,
+        &executor,
+        &candidate,
+        &multi,
+        Duration::from_secs(40),
+    )
+    .unwrap();
+    assert!(!replay.passed);
+    let observed = db.inspect_container_replay_experiment(replay.seq).unwrap();
+    assert_eq!(observed["cases"][0]["passed"], false);
+    assert_eq!(observed["cases"][1]["passed"], true);
+    assert!(observed["cases"][1]["receipt"].is_string());
     drop(db);
     let mut db = sese_runtime_spike::storage::Storage::open(&path).unwrap();
     let stored = db.inspect_container_replay_experiment(result.seq).unwrap();

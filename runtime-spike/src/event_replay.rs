@@ -33,6 +33,69 @@ pub struct Report {
     pub cases: Vec<CaseResult>,
 }
 
+// Keep replay semantics independent of the execution backend. Receipt data stays
+// with the backend that produced it; sharing this loop does not authorize a backend.
+fn execute_cases<R>(
+    cases: &[Case],
+    mut execute: impl FnMut(&Case) -> Result<(Verdict, R), String>,
+) -> Result<Vec<(CaseResult, Option<R>)>, String> {
+    let now = || -> Result<String, String> {
+        Ok(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_nanos()
+            .to_string())
+    };
+    let mut stopped = false;
+    cases
+        .iter()
+        .map(|case| {
+            if stopped {
+                return Ok((
+                    CaseResult {
+                        case: case.clone(),
+                        actual: None,
+                        error: Some("not run after earlier worker failure".into()),
+                        passed: false,
+                        started_unix_ns: None,
+                        finished_unix_ns: None,
+                        elapsed_ns: None,
+                    },
+                    None,
+                ));
+            }
+            let started = now()?;
+            let clock = Instant::now();
+            let (actual, receipt, error) = match execute(case) {
+                Ok((verdict, receipt)) => (Some(verdict), Some(receipt), None),
+                Err(error) => {
+                    stopped = true;
+                    (None, None, Some(error))
+                }
+            };
+            let elapsed = clock.elapsed().as_nanos().to_string();
+            let finished = now()?;
+            let passed = actual.is_some_and(|value| {
+                value.decision == case.expected.decision
+                    && value.score.to_bits() == case.expected.score.to_bits()
+                    && value.reason == case.expected.reason
+            });
+            Ok((
+                CaseResult {
+                    case: case.clone(),
+                    actual,
+                    error,
+                    passed,
+                    started_unix_ns: Some(started),
+                    finished_unix_ns: Some(finished),
+                    elapsed_ns: Some(elapsed),
+                },
+                receipt,
+            ))
+        })
+        .collect()
+}
+
 /// Separate experimental result; its sequence is not an application replay ID.
 #[cfg(unix)]
 pub struct ContainerReplayReport {
@@ -66,51 +129,31 @@ pub fn replay_container_synthetic(
             .to_string())
     };
     let started = now()?;
-    let mut rows = Vec::new();
-    let mut failed_execution = false;
-    for case in &pack.cases {
-        let (actual, error, receipt_path, receipt, started_case, finished_case) =
-            if failed_execution {
-                (
-                    None,
-                    Some("not run after earlier worker failure".to_string()),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            } else {
-                let case_start = now()?;
-                let outcome = executor.execute(&artifact, &case.window, &case.event, timeout);
-                let case_end = now()?;
-                match outcome {
-                    Ok(result) => (
-                        Some(result.verdict),
-                        None,
-                        Some(result.receipt_path.to_string_lossy().into_owned()),
-                        Some(result.receipt_json),
-                        Some(case_start),
-                        Some(case_end),
-                    ),
-                    Err(e) => {
-                        failed_execution = true;
-                        (None, Some(e), None, None, Some(case_start), Some(case_end))
-                    }
-                }
-            };
-        let passed = actual.is_some_and(|v| {
-            v.decision == case.expected.decision
-                && v.score.to_bits() == case.expected.score.to_bits()
-                && v.reason == case.expected.reason
-        });
+    let cases = execute_cases(&pack.cases, |case| {
+        let result = executor.execute(&artifact, &case.window, &case.event, timeout)?;
+        Ok((
+            result.verdict,
+            (
+                result.receipt_path.to_string_lossy().into_owned(),
+                result.receipt_json,
+            ),
+        ))
+    })?;
+    let mut rows = Vec::with_capacity(cases.len());
+    for (result, receipt) in cases {
+        let case = &result.case;
         let w = case.window;
         let e = case.event;
+        let (receipt_path, receipt_json) = match receipt {
+            Some((path, json)) => (Some(path), Some(json)),
+            None => (None, None),
+        };
         rows.push(serde_json::json!({"id":case.id,"window":{"count":w.count,"mean":w.mean,"mean_bits":format!("{:016x}",w.mean.to_bits()),"p99_us":w.p99_us,"last_error":w.last_error},
             "event":{"timestamp_ns":e.timestamp_ns,"entity_id":e.entity_id,"metric":e.metric,"metric_bits":format!("{:016x}",e.metric.to_bits()),"flags":e.flags},
             "expected":serde_json::from_str::<serde_json::Value>(&verdict_json(case.expected)).map_err(|e|e.to_string())?,
-            "actual":actual.map(|v| serde_json::from_str::<serde_json::Value>(&verdict_json(v)).unwrap()),
-            "error":error,"passed":passed,"receipt_path":receipt_path,"receipt":receipt,
-            "started_unix_ns":started_case,"finished_unix_ns":finished_case}));
+            "actual":result.actual.map(|v| serde_json::from_str::<serde_json::Value>(&verdict_json(v)).unwrap()),
+            "error":result.error,"passed":result.passed,"receipt_path":receipt_path,"receipt":receipt_json,
+            "started_unix_ns":result.started_unix_ns,"finished_unix_ns":result.finished_unix_ns}));
     }
     executor.verify_helpers()?;
     let passed = rows.iter().all(|row| row["passed"] == true);
@@ -228,57 +271,14 @@ fn replay_with_semantics(
         .map_err(|e| e.to_string())?
         .as_nanos()
         .to_string();
-    let mut stopped = false;
-    let results: Vec<_> = cases
-        .iter()
-        .map(|case| -> Result<CaseResult, String> {
-            if stopped {
-                return Ok(CaseResult {
-                    case: case.clone(),
-                    actual: None,
-                    error: Some("not run after earlier worker failure".into()),
-                    passed: false,
-                    started_unix_ns: None,
-                    finished_unix_ns: None,
-                    elapsed_ns: None,
-                });
-            }
-            let case_started = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos()
-                .to_string();
-            let monotonic_start = Instant::now();
-            let (actual, error) =
-                match executor.execute(&artifact, &case.window, &case.event, timeout) {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
-                };
-            if error.is_some() {
-                stopped = true;
-            }
-            let elapsed = monotonic_start.elapsed().as_nanos().to_string();
-            let case_finished = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_nanos()
-                .to_string();
-            let passed = actual.is_some_and(|v| {
-                v.decision == case.expected.decision
-                    && v.score.to_bits() == case.expected.score.to_bits()
-                    && v.reason == case.expected.reason
-            });
-            Ok(CaseResult {
-                case: case.clone(),
-                actual,
-                error,
-                passed,
-                started_unix_ns: Some(case_started),
-                finished_unix_ns: Some(case_finished),
-                elapsed_ns: Some(elapsed),
-            })
-        })
-        .collect::<Result<_, _>>()?;
+    let results = execute_cases(cases, |case| {
+        executor
+            .execute(&artifact, &case.window, &case.event, timeout)
+            .map(|verdict| (verdict, ()))
+    })?
+    .into_iter()
+    .map(|(result, _)| result)
+    .collect::<Vec<_>>();
     executor.verify_unchanged()?;
     let passed = results.iter().all(|c| c.passed);
     let run_id = db.save_event_replay(

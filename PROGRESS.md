@@ -1424,3 +1424,11 @@ The experimental worker now checks all those fields from `/proc/self/status` bef
 ## Integrated check of the identity-checked worker
 
 Pushed checkpoint `c4d8639` and ran the existing real Rust-to-container prepared-review comparison with the newly built identity-checked image `sha256:f607d2bfaab75de7f8d802dae9822e285bd05da4ffbe61955002dc4967d87069` on the local Docker Desktop endpoint. The targeted test passed (`/private/tmp/sese-current-integrated-container.log`): it checked stale preparation rejection, executed the fixed synthetic comparison, then recorded a rejection from the refreshed preview. No labelled synthetic probe containers remained. This is integration evidence for fixed synthetic candidates only; the container comparison remains advisory, unauthenticated, and ineligible for promotion. The local synthetic replay is still the review evidence and unclassified candidates cannot be executed.
+
+## Share replay case semantics across backends
+
+The previous turn verified the fixed synthetic container path but it remained separate from ordinary replay. Both paths now use the same case loop for exact verdict comparison, per-case timing, and stop-after-execution-error behavior. The local replay retains its existing timing record and the container experiment retains its own receipt representation; no container result becomes promotion evidence and no unclassified artifact is executed. This prepares a common replay seam without asserting that the experimental executor is a trusted boundary.
+
+Focused offline local replay and container-executor suites passed 22 tests (`/private/tmp/sese-shared-replay-focused.log`); Docker-dependent tests returned early there. A separate live Docker test using the current identity-checked image passed (`/private/tmp/sese-shared-replay-live.log`), including a two-case fixture where a valid wrong verdict was followed by a successful second case, and verified the experiment cannot pin a fixture. This is a fixed-synthetic integration check, not untrusted replay or proof of isolation.
+
+The integrated prepared-review comparison also passed live against the same image (`/private/tmp/sese-shared-replay-demo-live.log`). The full offline Rust suite passed 253 tests across 55 groups (`/private/tmp/sese-shared-replay-full.log`); Docker-dependent cases returned early there. `git diff --check` passed.
