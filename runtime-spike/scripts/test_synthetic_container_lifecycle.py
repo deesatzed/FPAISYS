@@ -242,6 +242,40 @@ class ContainerLifecycleTests(unittest.TestCase):
             subprocess.run(base + ["rm", "-f", created], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=10, check=True)
 
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE") and os.environ.get("SESE_TEST_WORKER_SHA256"), "requires a synthetic worker image and test pin")
+    def test_readonly_root_denies_worker_replacement_after_pin_check(self):
+        docker = shutil.which("docker")
+        image = os.environ["SESE_TEST_CANARY_IMAGE"]
+        pin = os.environ["SESE_TEST_WORKER_SHA256"]
+        base = [docker, "--host", self.docker_host]
+        marker = Path(self.journal_dir) / "copy-result"
+        worker = Path(self.journal_dir) / "replacement"
+        worker.write_text("#!/bin/sh\ncat >/dev/null\nprintf '\\002\\000\\000\\000\\000\\000\\000\\000\\000\\000\\010\\100\\004\\000\\000\\000'\n")
+        worker.chmod(0o755)
+        wrapper = Path(self.journal_dir) / "docker-race-wrapper"
+        wrapper.write_text("#!/usr/bin/env python3\nimport os,sys,subprocess\na=sys.argv[1:]\n"
+            + "if len(a)>2 and a[2]=='start':\n"
+            + " r=subprocess.run([" + repr(docker) + ", '--host', a[1], 'cp', " + repr(str(worker)) + ", a[-1]+':/event-worker'], capture_output=True)\n"
+            + " open(" + repr(str(marker)) + ",'w').write(str(r.returncode))\n"
+            + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+        wrapper.chmod(0o700)
+        result = run_synthetic(image, docker_host=self.docker_host, docker=str(wrapper),
+                               journal_dir=self.journal_dir, require_worker_profile=True,
+                               expected_worker_sha256=pin, timeout=30)
+        self.assertNotEqual(marker.read_text(), "0")
+        self.assertEqual(result["verdict"], (1, 3.0, 4))
+        receipt = json.loads(Path(result["receipt_path"]).read_text())
+        self.assertEqual(receipt["worker_pin_status"], "matched")
+        # The same replacement must work when the container root is writable.
+        cid = subprocess.check_output(base + ["create", "--network=none", "--cap-drop=ALL",
+            "--security-opt=no-new-privileges", "--pids-limit=16", "--memory=128m", "--memory-swap=128m",
+            "--cpus=1", "--user=65534:65534", image], text=True, timeout=15).strip()
+        try:
+            copy = subprocess.run(base + ["cp", str(worker), cid + ":/event-worker"], capture_output=True, timeout=15)
+            self.assertEqual(copy.returncode, 0, copy.stderr)
+        finally:
+            subprocess.run(base + ["rm", "-f", cid], check=True, timeout=15, stdout=subprocess.DEVNULL)
+
     @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
     def test_refuses_changed_network_before_starting_worker(self):
         docker = shutil.which("docker")
