@@ -65,9 +65,9 @@ The explicit prompt and preference pair come from `trace-fixture.json`; they are
 runtime-spike/target/debug/sese-outcome checkpoint "$SSESE_RUN_DIR/demo.db" > "$SSESE_RUN_DIR/checkpoint.json"
 SSESE_SEQ="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["seq"])' "$SSESE_RUN_DIR/checkpoint.json")"
 SSESE_HASH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hash"])' "$SSESE_RUN_DIR/checkpoint.json")"
-python3 runtime-spike/scripts/verify_ledger.py "$SSESE_RUN_DIR/demo.db" --seq "$SSESE_SEQ" --hash "$SSESE_HASH" --verify-synthetic-candidates --verify-event-followups
+python3 runtime-spike/scripts/verify_ledger.py "$SSESE_RUN_DIR/demo.db" --seq "$SSESE_SEQ" --hash "$SSESE_HASH" --verify-event-cycle
 ```
 
-The JSON reports which bindings were checked and continues to mark overall evidence verification incomplete. For later tamper detection, retain the checkpoint separately from the database and protect it; the local file created above is only a convenience copy. A checkpoint is not a signature, and these checks do not validate fixture quality, authenticate actors or prove worker isolation.
+The `--verify-event-cycle` option checks synthetic candidate links, typed-event replay, observations, reviews, outcomes, champion history, follow-up gates, and stream receipts. It requires the checkpoint to cover the ledger head in its read snapshot. Inspect the individual counts and `event_streams_without_receipts`; older streams may lack receipts. The JSON continues to mark overall evidence verification incomplete. For later tamper detection, retain the checkpoint separately from the database and protect it; the local file created above is only a convenience copy. A checkpoint is not a signature, and these checks do not validate fixture quality, authenticate actors or prove worker isolation.
 
 Run the automated suite with `cargo test --locked --manifest-path runtime-spike/Cargo.toml`. See [README.md](README.md) for failure inspection, guarded review resumption and implementation limits.

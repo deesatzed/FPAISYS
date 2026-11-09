@@ -152,7 +152,7 @@ fn independent_verifier_checks_both_stream_receipt_bindings() {
                     &seq,
                     "--hash",
                     hash,
-                    "--verify-event-stream-receipts",
+                    "--verify-event-cycle",
                 ])
                 .output()
                 .unwrap()
@@ -165,6 +165,10 @@ fn independent_verifier_checks_both_stream_receipt_bindings() {
         );
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["event_streams_without_receipts"], 0);
+        assert!(value["synthetic_candidates_checked"].as_u64().unwrap() > 0);
+        assert!(value["event_replay_bindings_checked"].as_u64().unwrap() > 0);
+        assert!(value["event_review_bindings_checked"].as_u64().unwrap() > 0);
+        assert_eq!(value["evidence_bindings_checked"], false);
         let key = if measured {
             "measured_stream_receipt_bindings_checked"
         } else {

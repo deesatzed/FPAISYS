@@ -1021,7 +1021,7 @@ def verify_event_export(conn, path, seq, checkpoint_hash):
     return True
 
 
-def verify(database, expected_seq, expected_hash, check_synthetic=False, check_replays=False, check_fixtures=False, check_workers=False, check_observations=False, check_reviews=False, check_champions=False, check_traces=False, check_followups=False, check_stream_receipts=False, check_attestations=False, event_export=None, signature_authorities=None):
+def verify(database, expected_seq, expected_hash, check_synthetic=False, check_replays=False, check_fixtures=False, check_workers=False, check_observations=False, check_reviews=False, check_champions=False, check_traces=False, check_followups=False, check_stream_receipts=False, check_attestations=False, event_export=None, signature_authorities=None, require_head=False):
     check_attestations = check_attestations or event_export is not None or signature_authorities is not None
     if expected_seq <= 0 or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
         raise ValueError("invalid checkpoint")
@@ -1047,6 +1047,8 @@ def verify(database, expected_seq, expected_hash, check_synthetic=False, check_r
             previous = recorded
         if not found:
             raise ValueError("checkpoint missing or mismatched")
+        if require_head and expected_seq != sequence:
+            raise ValueError("checkpoint does not cover ledger head")
         checked = verify_synthetic_candidates(conn) if check_synthetic else None
         check_any_replays = check_replays or check_fixtures or check_reviews or check_champions or check_traces or check_followups or check_attestations
         replays = verify_event_replays(conn) if check_any_replays else None
@@ -1105,6 +1107,7 @@ def main():
     parser.add_argument("database")
     parser.add_argument("--seq", type=int, required=True)
     parser.add_argument("--hash", required=True, dest="checkpoint_hash")
+    parser.add_argument("--verify-event-cycle", action="store_true", help="check synthetic candidates, typed event followups, and stream receipts")
     parser.add_argument("--verify-synthetic-candidates", action="store_true")
     parser.add_argument("--verify-event-replays", action="store_true")
     parser.add_argument("--verify-event-fixtures", action="store_true")
@@ -1120,11 +1123,15 @@ def main():
     parser.add_argument("--verify-event-signatures", metavar="AUTHORITIES_JSON")
     parser.add_argument("--authority-sha256")
     args = parser.parse_args()
+    if args.verify_event_cycle:
+        args.verify_synthetic_candidates = True
+        args.verify_event_followups = True
+        args.verify_event_stream_receipts = True
     try:
         if bool(args.verify_event_signatures) != bool(args.authority_sha256):
             raise ValueError("signature verification requires an authority file and digest")
         signature_authorities = (load_signature_authorities(args.verify_event_signatures, args.authority_sha256), args.authority_sha256) if args.verify_event_signatures else None
-        print(json.dumps(verify(args.database, args.seq, args.checkpoint_hash, args.verify_synthetic_candidates, args.verify_event_replays, args.verify_event_fixtures, args.verify_event_workers, args.verify_event_observations, args.verify_event_reviews, args.verify_event_champions, args.verify_event_traces, args.verify_event_followups, args.verify_event_stream_receipts, args.verify_event_attestations, args.verify_event_export, signature_authorities), sort_keys=True))
+        print(json.dumps(verify(args.database, args.seq, args.checkpoint_hash, args.verify_synthetic_candidates, args.verify_event_replays, args.verify_event_fixtures, args.verify_event_workers, args.verify_event_observations, args.verify_event_reviews, args.verify_event_champions, args.verify_event_traces, args.verify_event_followups, args.verify_event_stream_receipts, args.verify_event_attestations, args.verify_event_export, signature_authorities, require_head=args.verify_event_cycle), sort_keys=True))
     except (OSError, sqlite3.Error, ValueError, UnicodeError, OverflowError, struct.error, TypeError) as error:
         print(f"ledger verification failed: {error}", file=sys.stderr)
         return 1
