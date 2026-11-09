@@ -6,6 +6,7 @@ import hashlib
 import fcntl
 import re
 import shlex
+import sqlite3
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,7 @@ import tempfile
 import time
 import struct
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -917,6 +919,81 @@ class ContainerLifecycleTests(unittest.TestCase):
                 subprocess.run(["docker", "--host", self.docker_host, "rm", "-f", container_id], capture_output=True, text=True, timeout=10, check=True)
         remaining = subprocess.run(["docker", "--host", self.docker_host, "ps", "-aq", "--no-trunc", "--filter", "id=" + container_id], capture_output=True, text=True, timeout=5, check=True)
         self.assertEqual(remaining.stdout.strip(), "")
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a local synthetic worker image")
+    def test_real_container_oom_is_recorded_and_cannot_become_fixture_evidence(self):
+        # Fixed fault-injection executable, not a registered or untrusted candidate.
+        docker = shutil.which("docker")
+        image = os.environ["SESE_TEST_CANARY_IMAGE"]
+        base = [docker, "--host", self.docker_host]
+        tag = "sese-oom-probe:" + uuid.uuid4().hex
+        source_id = None
+        fault_image = None
+        tagged = False
+        root = Path(self.journal_dir)
+        fake = root / "oom-worker"
+        fake.write_text("#!/bin/sh\ncat >/dev/null\nexec awk 'BEGIN { s=\"x\"; while (1) s=s s }'\n")
+        fake.chmod(0o755)
+        marker = root / "oom-state"
+        wrapper = root / "docker-oom-wrapper"
+        wrapper.write_text("#!/usr/bin/env python3\nimport os,sys,subprocess\na=sys.argv[1:]\n"
+            + "if len(a)>2 and a[2]=='rm':\n"
+            + " r=subprocess.run([" + repr(docker) + ", '--host', a[1], 'inspect', '--format', '{{json .State}}', a[-1]], capture_output=True, text=True)\n"
+            + " open(" + repr(str(marker)) + ",'w').write(r.stdout)\n"
+            + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+        wrapper.chmod(0o700)
+        cli = Path(__file__).resolve().parents[1] / "target/debug/sese-outcome"
+        fixture = Path(__file__).resolve().parents[1] / "fixtures/event-synthetic-v1.json"
+        db = root / "app.db"
+        try:
+            source_id = subprocess.check_output(base + ["create", image], text=True, timeout=15).strip()
+            subprocess.run(base + ["cp", str(fake), source_id + ":/event-worker"], check=True, timeout=15, stdout=subprocess.DEVNULL)
+            fault_image = subprocess.check_output(base + ["commit", source_id, tag], text=True, timeout=30).strip()
+            tagged = True
+            for args in (["event-init", str(db)], ["event-builtin-register", str(db), "throttle"]):
+                result = subprocess.run([str(cli), *args], text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            command = [str(cli), "event-container-replay", str(db), "throttle", str(fixture), fault_image,
+                       self.docker_host, self.journal_dir, sys.executable, str(wrapper),
+                       str(Path(__file__).parent / "synthetic_container_worker.py"), "40"]
+            result = subprocess.run(command, text=True, capture_output=True, timeout=100)
+            self.assertNotEqual(result.returncode, 0)
+            report = json.loads(result.stdout)
+            self.assertFalse(report["passed"])
+            state = json.loads(marker.read_text())
+            self.assertTrue(state["OOMKilled"])
+            self.assertEqual(state["ExitCode"], 137)
+            receipt = json.loads(next(root.glob("sese-synthetic-*.json")).read_text())
+            self.assertEqual((receipt["state"], receipt["result_status"]), ("removed", "failed"))
+            remaining = subprocess.check_output(base + ["ps", "-aq", "--no-trunc", "--filter", "id=" + receipt["container_id"]], text=True, timeout=15)
+            self.assertEqual(remaining.strip(), "")
+            inspect = subprocess.run([str(cli), "event-container-replay-inspect", str(db), str(report["container_event_seq"])], capture_output=True, text=True, timeout=30)
+            self.assertEqual(inspect.returncode, 0, inspect.stderr)
+            self.assertFalse(json.loads(inspect.stdout)["promotion_evidence"])
+            pin = subprocess.run([str(cli), "event-pin", str(db), "domain", str(report["container_event_seq"]), "operator"], capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(pin.returncode, 0)
+            with sqlite3.connect(db) as conn:
+                self.assertEqual(conn.execute("SELECT count(*) FROM event_replay_runs").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT count(*) FROM event_fixture_pins").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT count(*) FROM event_champions").fetchone()[0], 0)
+        finally:
+            # Remove only this test's identified fault containers if the app did not finish cleanup.
+            if fault_image:
+                for path in root.glob("sese-synthetic-*.json"):
+                    record = json.loads(path.read_text())
+                    name = record.get("name", "")
+                    if record.get("image") != fault_image or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", name):
+                        continue
+                    remaining = subprocess.check_output(base + ["ps", "-aq", "--no-trunc", "--filter", "label=io.sese.synthetic-probe=" + name,
+                                                                  "--filter", "ancestor=" + fault_image], text=True, timeout=15)
+                    for container_id in remaining.splitlines():
+                        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+                            raise RuntimeError("invalid fault container ID")
+                        subprocess.run(base + ["rm", "-f", container_id], check=True, timeout=15, stdout=subprocess.DEVNULL)
+            if source_id:
+                subprocess.run(base + ["rm", "-f", source_id], check=True, timeout=15, stdout=subprocess.DEVNULL)
+            if tagged:
+                subprocess.run(base + ["image", "rm", tag], check=True, timeout=20, stdout=subprocess.DEVNULL)
 
     @unittest.skipUnless(os.environ.get("SESE_TEST_FLOOD_IMAGE"), "requires an explicitly selected local output-flood image")
     def test_real_output_flood_is_rejected_and_container_removed(self):
