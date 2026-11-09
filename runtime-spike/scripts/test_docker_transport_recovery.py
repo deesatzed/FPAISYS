@@ -7,7 +7,9 @@ import re
 import select
 import shutil
 import socket
+import sqlite3
 import struct
+import sys
 import subprocess
 import tempfile
 import threading
@@ -104,16 +106,40 @@ class DockerTransportRecoveryTests(unittest.TestCase):
                 + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
             wrapper.chmod(0o700)
             try:
-                with self.assertRaisesRegex(RuntimeError, "cleanup unconfirmed") as error:
-                    run_synthetic(image, docker=str(wrapper), journal_dir=journal,
-                                  docker_host=endpoint, timeout=20)
+                repo = Path(__file__).resolve().parents[1]
+                cli = repo / "target/debug/sese-outcome"
+                database = root / "replay.db"
+                for args in (["event-init", str(database)],
+                             ["event-builtin-register", str(database), "throttle"]):
+                    command = subprocess.run([str(cli), *args], capture_output=True, text=True, timeout=20)
+                    self.assertEqual(command.returncode, 0, command.stderr)
+                command = subprocess.run([str(cli), "event-container-replay", str(database), "throttle",
+                    str(repo / "fixtures/event-synthetic-v1.json"), image, endpoint, str(journal),
+                    sys.executable, str(wrapper), str(repo / "scripts/synthetic_container_worker.py"), "20"],
+                    capture_output=True, text=True, timeout=70)
+                self.assertNotEqual(command.returncode, 0)
+                report = json.loads(command.stdout)
+                self.assertFalse(report["passed"])
+                inspected = subprocess.run([str(cli), "event-container-replay-inspect", str(database),
+                    str(report["container_event_seq"])], capture_output=True, text=True, timeout=20)
+                self.assertEqual(inspected.returncode, 0, inspected.stderr)
+                experiment = json.loads(inspected.stdout)
+                self.assertFalse(experiment["promotion_evidence"])
+                with sqlite3.connect(database) as connection:
+                    self.assertEqual(connection.execute("SELECT count(*) FROM event_replay_runs").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT count(*) FROM event_fixture_pins").fetchone()[0], 0)
+                    self.assertEqual(connection.execute("SELECT count(*) FROM event_champions").fetchone()[0], 0)
                 self.assertEqual(stop.read_text(), "0")
                 self.assertEqual(worker_output.read_bytes(), struct.pack("<IdI", 1, 3.0, 4))
-                match = re.search(r"container_id=([0-9a-f]{64})", str(error.exception))
-                self.assertIsNotNone(match)
-                container_id = match.group(1)
                 receipt = next(journal.glob("sese-synthetic-*.json"))
-                self.assertEqual(json.loads(receipt.read_text())["state"], "pending")
+                self.assertIn("receipt_path=" + str(receipt.resolve()), experiment["cases"][0]["error"])
+                pending = json.loads(receipt.read_text())
+                self.assertEqual(pending["state"], "pending")
+                self.assertTrue(re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", pending["name"]))
+                container_id = subprocess.check_output([docker, "--host", host, "ps", "-aq", "--no-trunc",
+                    "--filter", "label=io.sese.synthetic-probe=" + pending["name"],
+                    "--filter", "ancestor=" + image], text=True, timeout=10).strip()
+                self.assertRegex(container_id, r"^[0-9a-f]{64}$")
                 self.assertEqual(inspect_pending(receipt, docker=docker)["status"], "unknown")
                 with self.assertRaisesRegex(RuntimeError, "unresolved synthetic container receipt"):
                     run_synthetic(image, docker=docker, journal_dir=journal,
