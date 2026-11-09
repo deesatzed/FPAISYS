@@ -132,6 +132,7 @@ class DockerTransportRecoveryTests(unittest.TestCase):
                 self.assertEqual(stop.read_text(), "0")
                 self.assertEqual(worker_output.read_bytes(), struct.pack("<IdI", 1, 3.0, 4))
                 receipt = next(journal.glob("sese-synthetic-*.json"))
+                self.assertIn("receipt_path=" + str(receipt.resolve()), report["failed_cases"][0]["error"])
                 self.assertIn("receipt_path=" + str(receipt.resolve()), experiment["cases"][0]["error"])
                 pending = json.loads(receipt.read_text())
                 self.assertEqual(pending["state"], "pending")

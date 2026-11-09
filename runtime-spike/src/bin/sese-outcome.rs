@@ -403,7 +403,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             println!(
                 "{}",
-                serde_json::json!({"schema":"sese-container-replay-experiment-result-v1","container_event_seq":report.seq,"candidate_id":candidate,"passed":report.passed,"synthetic":true,"promotion_evidence":false})
+                serde_json::json!({"schema":"sese-container-replay-experiment-result-v1","container_event_seq":report.seq,"candidate_id":candidate,"passed":report.passed,"failed_cases":report.failed_cases,"synthetic":true,"promotion_evidence":false})
             );
             if !report.passed {
                 return Err("synthetic container replay failed".into());

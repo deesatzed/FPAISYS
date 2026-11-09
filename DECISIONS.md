@@ -179,3 +179,5 @@ Disable image-inherited Docker health checks for synthetic container runs and re
 Include existing training-trace binding verification in `--verify-event-cycle`. Keep overall `evidence_bindings_checked` false: trace bindings alone do not verify signatures, authority custody, source or outcome truth, or all evidence classes. Use the cycle option in both operator walkthroughs so its current-head requirement also applies to their independent verification.
 
 Send container requests and drain responses using nonblocking pipes under the same monotonic deadline. This prevents a worker that stops reading a larger future request from indefinitely blocking the bridge. It does not change the built-in-only execution policy or guarantee cleanup when the daemon is unavailable.
+
+Return failed and skipped case summaries in the `event-container-replay` result, including the existing error text and receipt path when available. This avoids an extra experiment lookup for routine diagnosis; it does not infer the failure cause, authenticate the receipt, or change recovery identity checks or promotion rules.

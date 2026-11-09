@@ -101,6 +101,7 @@ fn execute_cases<R>(
 pub struct ContainerReplayReport {
     pub seq: i64,
     pub passed: bool,
+    pub failed_cases: Vec<serde_json::Value>,
 }
 
 /// Execute only fixed built-ins in experimental containers and retain their case results.
@@ -157,6 +158,11 @@ pub fn replay_container_synthetic(
     }
     executor.verify_helpers()?;
     let passed = rows.iter().all(|row| row["passed"] == true);
+    let failed_cases = rows
+        .iter()
+        .filter(|row| row["passed"] != true)
+        .map(|row| serde_json::json!({"id": row["id"], "error": row["error"], "actual": row["actual"], "expected": row["expected"]}))
+        .collect();
     let finished = now()?;
     let payload = serde_json::json!({"schema":"sese-container-replay-experiment-v1", "candidate_id":candidate,
         "fixture_version":pack.version,"fixture_digest":pack.digest,"state_semantics":pack.state_semantics,
@@ -169,7 +175,7 @@ pub fn replay_container_synthetic(
         (checkpoint.0, &checkpoint.1),
         &finished,
     )?;
-    Ok(ContainerReplayReport { seq, passed })
+    Ok(ContainerReplayReport { seq, passed, failed_cases })
 }
 
 pub(crate) fn code(d: Decision) -> u32 {

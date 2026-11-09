@@ -373,6 +373,9 @@ fn failed_container_bridge_records_failure_and_cannot_pin_fixture() {
     )
     .unwrap();
     assert!(!result.passed);
+    assert_eq!(result.failed_cases.len(), 2);
+    assert!(result.failed_cases[0]["error"].as_str().unwrap().contains("receipt_path="));
+    assert_eq!(result.failed_cases[1]["error"], "not run after earlier worker failure");
     let evidence = db.inspect_container_replay_experiment(result.seq).unwrap();
     assert_eq!(evidence["cases"][0]["passed"], false);
     assert!(evidence["cases"][0]["error"]
