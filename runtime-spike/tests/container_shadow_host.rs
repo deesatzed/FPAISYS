@@ -729,32 +729,34 @@ fn container_shadow_uses_prior_state_and_survives_restart() {
     assert_eq!(second.prior.mean, 7.0);
     assert_eq!(stream.snapshot().count, 2);
     assert!(db.inspect_event_review(second.seq).is_err());
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
-        .args([
-            "event-container-shadow",
-            path.to_str().unwrap(),
-            "domain",
-            "cli-stream",
-            "2",
-            "allow",
-            "throttle",
-            "9",
-            "42",
-            "7.0",
-            "4",
-            &image,
-            &host,
-            directory.to_str().unwrap(),
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/docker",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/scripts/synthetic_container_worker.py"
-            ),
-            "40",
-        ])
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sese-outcome"));
+    command.args([
+        "event-container-shadow",
+        path.to_str().unwrap(),
+        "domain",
+        "cli-stream",
+        "2",
+        "allow",
+        "throttle",
+        "9",
+        "42",
+        "7.0",
+        "4",
+        &image,
+        &host,
+        directory.to_str().unwrap(),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/docker",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/synthetic_container_worker.py"
+        ),
+        "40",
+    ]);
+    if let Ok(pin) = std::env::var("SESE_TEST_WORKER_SHA256") {
+        command.args(["--worker-sha256", &pin]);
+    }
+    let output = command.output().unwrap();
     assert!(
         output.status.success(),
         "{}",

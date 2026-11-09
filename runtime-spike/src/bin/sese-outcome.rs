@@ -102,6 +102,15 @@ fn read_bounded_file(path: &str, limit: u64) -> Result<Vec<u8>, Box<dyn std::err
     Ok(bytes)
 }
 
+#[cfg(unix)]
+fn optional_worker_pin(args: &[String]) -> Result<Option<&str>, Box<dyn std::error::Error>> {
+    match args {
+        [] => Ok(None),
+        [flag, pin] if flag == "--worker-sha256" => Ok(Some(pin)),
+        _ => Err("invalid worker pin arguments".into()),
+    }
+}
+
 fn decode_lower_hex<const N: usize>(text: &str) -> Result<[u8; N], &'static str> {
     let input = text.as_bytes();
     if input.len() != N * 2
@@ -155,7 +164,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     match args[0].as_str() {
         #[cfg(unix)]
-        "event-container-evaluate" if args.len() == 13 || args.len() == 14 => {
+        "event-container-evaluate" if (13..=16).contains(&args.len()) => {
+            let trailing = &args[13..];
+            let (prepared_path, pin_args) = match trailing {
+                [] => (None, &trailing[..]),
+                [flag, ..] if flag == "--worker-sha256" => (None, trailing),
+                [path, rest @ ..] => (Some(path), rest),
+            };
+            let worker_pin = optional_worker_pin(pin_args)?;
             let replay_id: i64 = args[3].parse()?;
             let observation_id: i64 = args[4].parse()?;
             let timeout = std::time::Duration::from_secs(args[12].parse()?);
@@ -165,8 +181,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let pack =
                 sese_runtime_spike::fixture_file::parse(&read_bounded_file(&args[5], 1_048_576)?)?;
             let preview = db.event_review_preview(replay_id, &args[2])?;
-            let mut prepared: Option<PreparedEvaluation> = if args.len() == 14 {
-                let value = serde_json::from_slice(&read_bounded_file(&args[13], 8_388_608)?)?;
+            let mut prepared: Option<PreparedEvaluation> = if let Some(path) = prepared_path {
+                let value = serde_json::from_slice(&read_bounded_file(path, 8_388_608)?)?;
                 Some(value)
             } else {
                 None
@@ -213,6 +229,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
                 &args[9], &args[11], &args[10], &args[6], &args[7], &args[8],
             )?;
+            let executor = if let Some(pin) = worker_pin {
+                executor.with_worker_pin(pin)?
+            } else {
+                executor
+            };
             let container_replay = sese_runtime_spike::event_replay::replay_container_synthetic(
                 &mut db, &executor, candidate, &pack, timeout,
             )?;
@@ -264,10 +285,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!("{combined}");
         }
         #[cfg(unix)]
-        "event-container-observation" if args.len() == 11 => {
+        "event-container-observation" if args.len() == 11 || args.len() == 13 => {
+            let worker_pin = optional_worker_pin(&args[11..])?;
             let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
                 &args[7], &args[9], &args[8], &args[4], &args[5], &args[6],
             )?;
+            let executor = if let Some(pin) = worker_pin {
+                executor.with_worker_pin(pin)?
+            } else {
+                executor
+            };
             let report = sese_runtime_spike::event_host::compare_container_observation(
                 &mut db,
                 &executor,
@@ -301,7 +328,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         #[cfg(unix)]
-        "event-container-shadow" if args.len() == 18 => {
+        "event-container-shadow" if args.len() == 18 || args.len() == 20 => {
+            let worker_pin = optional_worker_pin(&args[18..])?;
             use sha2::{Digest, Sha256};
             let champion = format!(
                 "{:x}",
@@ -320,6 +348,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let executor = sese_runtime_spike::event_executor::SyntheticContainerExecutor::new(
                 &args[14], &args[16], &args[15], &args[11], &args[12], &args[13],
             )?;
+            let executor = if let Some(pin) = worker_pin {
+                executor.with_worker_pin(pin)?
+            } else {
+                executor
+            };
             let mut host = sese_runtime_spike::event_host::ContainerShadowHost::open(
                 &mut db,
                 &args[2],

@@ -942,25 +942,27 @@ fn operator_can_compare_stored_container_evidence_in_a_read_only_snapshot() {
             historical.seq
         )
         .is_err());
-    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
-        .args([
-            "event-container-observation",
-            path.to_str().unwrap(),
-            "domain",
-            &different_observation.id.to_string(),
-            &image,
-            &host,
-            journal.to_str().unwrap(),
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/docker",
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/scripts/synthetic_container_worker.py"
-            ),
-            "40",
-        ])
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sese-outcome"));
+    command.args([
+        "event-container-observation",
+        path.to_str().unwrap(),
+        "domain",
+        &different_observation.id.to_string(),
+        &image,
+        &host,
+        journal.to_str().unwrap(),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/docker",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/synthetic_container_worker.py"
+        ),
+        "40",
+    ]);
+    if let Ok(pin) = std::env::var("SESE_TEST_WORKER_SHA256") {
+        command.args(["--worker-sha256", &pin]);
+    }
+    let cli = command.output().unwrap();
     assert!(
         cli.status.success(),
         "{}",

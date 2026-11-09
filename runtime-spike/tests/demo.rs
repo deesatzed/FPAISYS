@@ -20,6 +20,18 @@ fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step
     let db = dir.join("app.db");
     let journal = dir.join("journal");
     std::fs::create_dir(&journal).unwrap();
+    let pin = std::env::var("SESE_TEST_WORKER_SHA256").ok();
+    let marker = dir.join("copies");
+    let docker = if pin.is_some() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("docker-wrapper");
+        let source = format!("#!/bin/sh\nif [ \"$3\" = cp ]; then printf x >> '{}'; fi\nexec /usr/local/bin/docker \"$@\"\n", marker.display());
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path.to_str().unwrap().to_owned()
+    } else {
+        "/usr/local/bin/docker".to_owned()
+    };
     let fixture = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/fixtures/event-measured-synthetic-v1.json"
@@ -39,28 +51,30 @@ fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step
     let prepared = dir.join("prepared.json");
     std::fs::write(&prepared, &output.stdout).unwrap();
     let run_comparison = || {
-        Command::new(env!("CARGO_BIN_EXE_sese-outcome"))
-            .args([
-                "event-container-evaluate",
-                db.to_str().unwrap(),
-                "typed-cycle",
-                &snapshot["replay_id"].as_i64().unwrap().to_string(),
-                &snapshot["observation_id"].as_i64().unwrap().to_string(),
-                fixture,
-                &image,
-                &host,
-                journal.to_str().unwrap(),
-                "/opt/homebrew/bin/python3",
-                "/usr/local/bin/docker",
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/scripts/synthetic_container_worker.py"
-                ),
-                "40",
-                prepared.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap()
+        let mut command = Command::new(env!("CARGO_BIN_EXE_sese-outcome"));
+        command.args([
+            "event-container-evaluate",
+            db.to_str().unwrap(),
+            "typed-cycle",
+            &snapshot["replay_id"].as_i64().unwrap().to_string(),
+            &snapshot["observation_id"].as_i64().unwrap().to_string(),
+            fixture,
+            &image,
+            &host,
+            journal.to_str().unwrap(),
+            "/opt/homebrew/bin/python3",
+            &docker,
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/synthetic_container_worker.py"
+            ),
+            "40",
+            prepared.to_str().unwrap(),
+        ]);
+        if let Some(pin) = &pin {
+            command.args(["--worker-sha256", pin]);
+        }
+        command.output().unwrap()
     };
     let mut stale = snapshot.clone();
     stale["checkpoint"]["hash"] = serde_json::json!("0".repeat(64));
@@ -76,6 +90,13 @@ fn container_comparison_refreshes_prepared_decision_without_an_extra_review_step
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    if pin.is_some() {
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            b"xxx",
+            "pin checked for replay, champion and shadow"
+        );
+    }
     let combined: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(combined["promotion_evidence"], false);
     assert_eq!(combined["prepared"]["checkpoint"], combined["checkpoint"]);
