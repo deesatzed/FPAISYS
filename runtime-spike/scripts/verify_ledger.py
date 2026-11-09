@@ -1107,7 +1107,7 @@ def main():
     parser.add_argument("database")
     parser.add_argument("--seq", type=int, required=True)
     parser.add_argument("--hash", required=True, dest="checkpoint_hash")
-    parser.add_argument("--verify-event-cycle", action="store_true", help="check synthetic candidates, typed event followups, and stream receipts")
+    parser.add_argument("--verify-event-cycle", action="store_true", help="check synthetic candidates, typed event followups, traces, and stream receipts")
     parser.add_argument("--verify-synthetic-candidates", action="store_true")
     parser.add_argument("--verify-event-replays", action="store_true")
     parser.add_argument("--verify-event-fixtures", action="store_true")
@@ -1126,6 +1126,7 @@ def main():
     if args.verify_event_cycle:
         args.verify_synthetic_candidates = True
         args.verify_event_followups = True
+        args.verify_event_traces = True
         args.verify_event_stream_receipts = True
     try:
         if bool(args.verify_event_signatures) != bool(args.authority_sha256):

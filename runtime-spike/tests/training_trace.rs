@@ -296,6 +296,24 @@ fn synthetic_trace_preserves_asserted_prompt_response_and_explicit_pair() {
     assert_eq!(checked["event_trace_bindings_checked"], 4);
     assert_eq!(checked["event_review_bindings_checked"], 1);
     assert_eq!(checked["evidence_bindings_checked"], false);
+    let verify_cycle = || {
+        Command::new("python3")
+            .args([
+                script.to_str().unwrap(),
+                db.to_str().unwrap(),
+                "--seq",
+                &seq,
+                "--hash",
+                hash,
+                "--verify-event-cycle",
+            ])
+            .output()
+            .unwrap()
+    };
+    let cycle = verify_cycle();
+    assert!(cycle.status.success(), "{}", String::from_utf8_lossy(&cycle.stderr));
+    let cycle: serde_json::Value = serde_json::from_slice(&cycle.stdout).unwrap();
+    assert_eq!(cycle["event_trace_bindings_checked"], 4);
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute(
         "UPDATE event_training_traces SET preferred='forged' WHERE id=?1",
@@ -303,6 +321,7 @@ fn synthetic_trace_preserves_asserted_prompt_response_and_explicit_pair() {
     )
     .unwrap();
     assert!(!independently_verify().status.success());
+    assert!(!verify_cycle().status.success());
     conn.execute(
         "UPDATE event_training_traces SET preferred='Human choice' WHERE id=?1",
         [id.parse::<i64>().unwrap()],

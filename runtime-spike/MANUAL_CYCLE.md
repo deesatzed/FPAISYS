@@ -88,7 +88,7 @@ esac
 "$SSESE_CMD" checkpoint "$SSESE_DB" > "$SSESE_DIR/checkpoint.json"
 SSESE_SEQ="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["seq"])' "$SSESE_DIR/checkpoint.json")"
 SSESE_HASH="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["hash"])' "$SSESE_DIR/checkpoint.json")"
-python3 runtime-spike/scripts/verify_ledger.py "$SSESE_DB" --seq "$SSESE_SEQ" --hash "$SSESE_HASH" --verify-synthetic-candidates --verify-event-followups --verify-event-stream-receipts
+python3 runtime-spike/scripts/verify_ledger.py "$SSESE_DB" --seq "$SSESE_SEQ" --hash "$SSESE_HASH" --verify-event-cycle
 printf 'Artifacts: %s\n' "$SSESE_DIR"
 ```
 
