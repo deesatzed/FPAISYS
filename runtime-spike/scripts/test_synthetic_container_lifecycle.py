@@ -124,6 +124,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         report = {"Id": container, "Image": image, "Mounts": [],
                   "State": {"Status": "created", "Running": False},
                   "Config": {"Image": image, "User": "65534:65534", "OpenStdin": True,
+                             "Healthcheck": {"Test": ["NONE"]},
                              "Labels": {"io.sese.synthetic-probe": name}},
                   "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
                                  "CapAdd": None, "SecurityOpt": ["no-new-privileges"], "Privileged": False,
@@ -139,6 +140,7 @@ class ContainerLifecycleTests(unittest.TestCase):
                 ("HostConfig", "NanoCpus", 0), ("HostConfig", "Privileged", True),
                 ("HostConfig", "PidMode", "host"), ("HostConfig", "IpcMode", "host"),
                 ("HostConfig", "Binds", ["/host:/host"]), ("HostConfig", "GroupAdd", ["0"]), ("Config", "User", "0"),
+                ("Config", "Healthcheck", {"Test": ["CMD", "/bin/true"]}),
                 ("State", "Running", True)]:
             with self.subTest(field=field):
                 changed = json.loads(json.dumps(report))
@@ -153,6 +155,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         report = {"Id": container, "Image": image, "Mounts": [],
                   "State": {"Status": "created", "Running": False},
                   "Config": {"Image": image, "User": "65534:65534", "OpenStdin": True,
+                             "Healthcheck": {"Test": ["NONE"]},
                              "Entrypoint": ["/event-worker", "--require-isolation-v1"], "Cmd": None,
                              "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
                              "Labels": {"io.sese.synthetic-probe": name}},
@@ -193,6 +196,40 @@ class ContainerLifecycleTests(unittest.TestCase):
                     run_synthetic(image, docker=str(wrapper), journal_dir=self.journal_dir,
                                   docker_host=self.docker_host, require_worker_profile=True)
                 self.assertFalse(marker.exists())
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a local synthetic worker image")
+    def test_inherited_healthcheck_is_disabled_and_checked_before_start(self):
+        docker = shutil.which("docker")
+        base = [docker, "--host", self.docker_host]
+        image = os.environ["SESE_TEST_CANARY_IMAGE"]
+        tag = "sese-health-probe:" + uuid.uuid4().hex
+        source = None
+        tagged = False
+        try:
+            source = subprocess.check_output(base + ["create", image], text=True, timeout=15).strip()
+            derived = subprocess.check_output(base + ["commit", "--change", "HEALTHCHECK CMD /bin/true", source, tag], text=True, timeout=30).strip()
+            tagged = True
+            image_check = subprocess.check_output(base + ["image", "inspect", "--format", "{{json .Config.Healthcheck.Test}}", derived], text=True, timeout=15)
+            self.assertEqual(json.loads(image_check), ["CMD-SHELL", "/bin/true"])
+            result = run_synthetic(derived, docker=docker, journal_dir=self.journal_dir,
+                                   docker_host=self.docker_host, require_worker_profile=True)
+            self.assertEqual(result["verdict"], (1, 3.0, 4))
+            marker = Path(self.journal_dir) / "health-started"
+            wrapper = Path(self.journal_dir) / "docker-health-wrapper"
+            wrapper.write_text("#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\n"
+                + "if len(a)>2 and a[2]=='start': open(" + repr(str(marker)) + ",'w').close()\n"
+                + "if len(a)>2 and a[2]=='create': a.remove('--no-healthcheck')\n"
+                + "os.execv(" + repr(docker) + ",[" + repr(docker) + "]+a)\n")
+            wrapper.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "configuration unconfirmed or mismatched"):
+                run_synthetic(derived, docker=str(wrapper), journal_dir=self.journal_dir,
+                              docker_host=self.docker_host, require_worker_profile=True)
+            self.assertFalse(marker.exists())
+        finally:
+            if source:
+                subprocess.run(base + ["rm", "-f", source], capture_output=True, timeout=15, check=True)
+            if tagged:
+                subprocess.run(base + ["image", "rm", tag], capture_output=True, timeout=15, check=True)
 
     @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a worker image with the isolation self-check")
     def test_worker_self_check_accepts_profile_and_rejects_relaxed_restrictions(self):

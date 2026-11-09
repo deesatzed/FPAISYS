@@ -540,6 +540,7 @@ def _configuration_matches(output, container_id, image, name, *, require_worker_
         return (obj["Id"] == container_id and obj["Image"] == image
                 and obj["Mounts"] == [] and state["Status"] == "created" and state["Running"] is False
                 and config["Image"] == image and config["User"] == "65534:65534"
+                and config["Healthcheck"]["Test"] == ["NONE"]
                 and (not require_worker_profile or (config["Entrypoint"] == ["/event-worker", "--require-isolation-v1"]
                      and config["Cmd"] in (None, [])
                      and config["Env"] == ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]))
@@ -602,7 +603,7 @@ def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidat
     args = [
         docker, "--host", host, "create", "--pull=never", "--interactive", "--name", name,
         "--label", "io.sese.synthetic-probe=" + name,
-        "--network=none", "--read-only", "--cap-drop=ALL",
+        "--network=none", "--read-only", "--cap-drop=ALL", "--no-healthcheck",
         "--security-opt=no-new-privileges", "--pids-limit=16",
         "--memory=128m", "--memory-swap=128m", "--cpus=1",
         "--user=65534:65534", image,
