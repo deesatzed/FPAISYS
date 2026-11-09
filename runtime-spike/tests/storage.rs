@@ -169,3 +169,36 @@ fn failed_migration_rolls_back_version_and_schema() {
     drop(conn);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn existing_v37_database_gets_nonunique_ledger_lookup_index_without_rewriting_records() {
+    let path = std::env::temp_dir().join(format!(
+        "sese-ledger-index-{}-{}.db",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let db = Storage::open(&path).unwrap();
+    let candidate = db.register(b"preserved candidate").unwrap();
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("DROP INDEX IF EXISTS ledger_kind_reference_lookup;")
+        .unwrap();
+    drop(conn);
+    let db = Storage::open(&path).unwrap();
+    assert_eq!(db.artifact(&candidate).unwrap(), b"preserved candidate");
+    drop(db);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT payload FROM ledger_events WHERE kind='event_observation' AND reference=?1", [1], |r| r.get(3)).unwrap();
+    assert!(plan.contains("ledger_kind_reference_lookup"), "{plan}");
+    let unique: i64 = conn.query_row("SELECT [unique] FROM pragma_index_list('ledger_events') WHERE name='ledger_kind_reference_lookup'", [], |r| r.get(0)).unwrap();
+    assert_eq!(unique, 0);
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 37);
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}

@@ -455,14 +455,21 @@ def _check_journal(directory_fd):
             raise RuntimeError(f"unresolved synthetic container receipt: {filename}") from exc
 
 
-def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
+def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), timeout=15, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False, request_bytes=None):
     """Serialize cooperating runs in one journal; unresolved receipts prevent launch."""
     if not isinstance(image, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
     if not isinstance(timeout, (float, int)) or not math.isfinite(timeout) or not 0 < timeout <= 60:
         raise ValueError("timeout must be between zero and 60 seconds")
     _validate_host(docker_host)
-    _synthetic_request(candidate, event, window)
+    expected, _ = _synthetic_request(candidate, event, window)
+    if request_bytes is None:
+        request = expected
+    elif type(request_bytes) is bytes and request_bytes == expected:
+        request = request_bytes
+    else:
+        raise ValueError("request does not match fixed synthetic candidate and inputs")
+    artifact = request[56:]
     if probe_name is not None and (not isinstance(probe_name, str) or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", probe_name)):
         raise ValueError("invalid probe name")
     directory = Path(journal_dir).resolve(strict=True)
@@ -481,7 +488,7 @@ def run_synthetic(image, *, journal_dir, docker_host, candidate="throttle", even
                     raise RuntimeError("journal lock deadline exceeded")
                 time.sleep(min(0.02, remaining))
         _check_journal(directory_fd)
-        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name, require_worker_profile=require_worker_profile)
+        return _run_synthetic_locked(image, journal_dir=directory, docker_host=docker_host, candidate=candidate, event=event, window=window, request=request, artifact=artifact, deadline=lock_deadline, docker=docker, intent_callback=intent_callback, probe_name=probe_name, require_worker_profile=require_worker_profile)
     finally:
         os.close(directory_fd)
 
@@ -500,6 +507,7 @@ def _configuration_matches(output, container_id, image, name, *, require_worker_
                 and config["OpenStdin"] is True and config["Labels"].get("io.sese.synthetic-probe") == name
                 and host["NetworkMode"] == "none" and host["ReadonlyRootfs"] is True
                 and host["CapDrop"] == ["ALL"] and host["CapAdd"] in (None, [])
+                and host["GroupAdd"] in (None, [])
                 and host["SecurityOpt"] == ["no-new-privileges"] and host["Privileged"] is False
                 and host["PidsLimit"] == 16 and host["Memory"] == 134217728
                 and host["MemorySwap"] == 134217728 and host["NanoCpus"] == 1000000000
@@ -511,12 +519,14 @@ def _configuration_matches(output, container_id, image, name, *, require_worker_
         return False
 
 
-def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate="throttle", event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
+def _run_synthetic_locked(image, *, journal_dir, docker_host, deadline, candidate, event, window, request, artifact, docker="docker", intent_callback=None, probe_name=None, require_worker_profile=False):
     """Run a built-in synthetic candidate; return only after verified cleanup."""
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
         raise ValueError("image digest must be a full lowercase sha256 identifier")
     host = _validate_host(docker_host)
-    request, artifact = _synthetic_request(candidate, event, window)
+    expected, expected_artifact = _synthetic_request(candidate, event, window)
+    if type(request) is not bytes or request != expected or type(artifact) is not bytes or artifact != expected_artifact:
+        raise ValueError("request does not match fixed synthetic candidate and inputs")
     if probe_name is not None and (not isinstance(probe_name, str) or not re.fullmatch(r"sese-synthetic-[0-9a-f]{32}", probe_name)):
         raise ValueError("invalid probe name")
     name = probe_name or "sese-synthetic-" + uuid.uuid4().hex

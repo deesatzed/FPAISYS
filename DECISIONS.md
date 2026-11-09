@@ -141,3 +141,19 @@ Offer a single `event-container-evaluate` operation for an existing measured syn
 When that operation receives an existing prepared review, validate it before launch and return a refreshed prepared review only if the two experimental events are the only ledger additions and the underlying review is unchanged. Permit `event-review-prepared` to consume the returned comparison directly. The ordinary explicit decision and promotion checks remain authoritative; experimental records remain advisory.
 
 Report a non-executing structural check automatically with event intake, using the existing bounded Wasmi parser configuration to inspect imports and the event export signature. Store incompatible bytes as before. A compatible result is not behavioral validation, execution authorization, or promotion evidence; parsing occurs on the host and does not establish parser security.
+
+Forward the application bridge's original immutable request through the synthetic container lifecycle after checking exact equality with the allowed built-in and typed inputs. Hash the artifact slice from that request. This preserves the built-in-only restriction; it does not authorize unclassified candidate execution or authenticate the worker.
+
+Normalize the built worker executable's filesystem timestamp in the experimental Dockerfile. For repeatability checks, pass `SOURCE_DATE_EPOCH=0` explicitly to the build. Matching worker bytes, layers or configuration across local builds is not authenticated source or builder provenance, and the observed image IDs still differ.
+
+Record per-case local synthetic event replay timing in a versioned ledger event appended atomically with its replay. Bind it to the replay event hash and ordered case IDs, report wall-clock start and finish separately from monotonic elapsed nanoseconds, and verify the link independently. Preserve older replay hashes and report their missing timing as unknown rather than backfilling it.
+
+Stop local synthetic event replay after the first worker execution error, retaining the failed case and marking every remaining case as skipped. Continue after a valid but unexpected verdict. Version timing records as v2 so skipped cases have null times; retain v1 interpretation for older runs that could execute additional cases after an error. Both verifiers check v2 skip ordering.
+
+Keep review previews bounded to the latest 100 observations in a domain, ordered chronologically, and mark a preview when older observations are omitted. The guarded review transaction accepts only an observation in that same recent window at the checkpoint; older observations remain available through paginated inspection. This removes a hard stop for long-lived domains without expanding the evidence represented in a single decision.
+
+Create an idempotent non-unique `(kind, reference)` ledger index in the existing writable-open transaction. The index is a rebuildable query optimization, does not change the v37 evidence format, and must not hide duplicate ledger bindings. Read-only opens do not create it; old databases remain readable without migration.
+
+Require the experimental synthetic container pre-start inspection to report no supplementary `GroupAdd` entries. Missing or nonempty values fail closed and trigger the existing cleanup path. This is a reported Docker configuration check, not proof of group membership, daemon authenticity, or a containment boundary.
+
+For the experimental Linux worker profile, fail before reading input unless `/proc/self/status` reports UID/GID 65534 in all four slots, exactly supplementary group 65534, and empty inheritable, permitted, effective, bounding, and ambient capabilities. This deliberately restricts compatible environments and supplements, but does not authenticate, the launcher inspection; the synthetic-only execution restriction remains.

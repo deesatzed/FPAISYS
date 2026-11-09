@@ -369,6 +369,19 @@ pub(crate) fn verify_storage(conn: &Connection) -> Result<bool, String> {
             return Ok(false);
         }
     }
+    let mut timing_stmt = conn
+        .prepare("SELECT reference FROM ledger_events WHERE kind='event_replay_timing'")
+        .map_err(|e| e.to_string())?;
+    let timing_ids = timing_stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for id in timing_ids {
+        if !matches!(event_replay_timings(conn, id), Ok(Some(_))) {
+            return Ok(false);
+        }
+    }
     let mut observation_stmt = conn
         .prepare("SELECT reference FROM ledger_events WHERE kind='event_observation'")
         .map_err(|e| e.to_string())?;
@@ -1052,6 +1065,283 @@ pub(crate) fn append_event_replay(conn: &Connection, id: i64, time: &str) -> Res
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayTimingCase {
+    case_id: String,
+    #[serde(deserialize_with = "required_optional_string")]
+    started_unix_ns: Option<String>,
+    #[serde(deserialize_with = "required_optional_string")]
+    finished_unix_ns: Option<String>,
+    #[serde(deserialize_with = "required_optional_string")]
+    elapsed_ns: Option<String>,
+}
+
+fn required_optional_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    serde::Deserialize::deserialize(deserializer)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayTiming {
+    schema: String,
+    replay_hash: String,
+    cases: Vec<ReplayTimingCase>,
+}
+
+/// Persist timing as a separate chain event so existing replay hashes remain unchanged.
+pub(crate) fn append_event_replay_timings(
+    conn: &Connection,
+    id: i64,
+    time: &str,
+    results: &[crate::event_replay::CaseResult],
+) -> Result<(), String> {
+    let parent: String = conn
+        .query_row(
+            "SELECT hash FROM ledger_events WHERE kind='event_replay' AND reference=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let timing = ReplayTiming {
+        schema: "sese-event-replay-timing-v2".into(),
+        replay_hash: parent,
+        cases: results
+            .iter()
+            .map(|r| ReplayTimingCase {
+                case_id: r.case.id.clone(),
+                started_unix_ns: r.started_unix_ns.clone(),
+                finished_unix_ns: r.finished_unix_ns.clone(),
+                elapsed_ns: r.elapsed_ns.clone(),
+            })
+            .collect(),
+    };
+    let payload = serde_json::to_string(&timing).map_err(|e| e.to_string())?;
+    if payload.len() > 4_194_304 {
+        return Err("replay timings too large".into());
+    }
+    let (last, previous): (i64, String) = conn
+        .query_row(
+            "SELECT seq,hash FROM ledger_events ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let seq = last.checked_add(1).ok_or("ledger sequence overflow")?;
+    let digest = hash(&previous, "event_replay_timing", id, &payload, time);
+    conn.execute(
+        "INSERT INTO ledger_events VALUES (?1,'event_replay_timing',?2,?3,?4,?5,?6)",
+        params![seq, id, payload, time, previous, digest],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Older runs have no timing event and are reported as unknown, never backfilled.
+pub(crate) fn event_replay_timings(
+    conn: &Connection,
+    id: i64,
+) -> Result<Option<serde_json::Value>, String> {
+    let mut stmt = conn.prepare("SELECT seq,payload,created_ns FROM ledger_events WHERE kind='event_replay_timing' AND reference=?1").map_err(|e|e.to_string())?;
+    let rows = stmt
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() != 1 {
+        return Err("duplicate replay timings".into());
+    }
+    let (seq, payload, time) = &rows[0];
+    if payload.len() > 4_194_304 {
+        return Err("replay timings too large".into());
+    }
+    let timing: ReplayTiming =
+        serde_json::from_str(payload).map_err(|_| "invalid replay timings")?;
+    let (parent_seq,parent_hash,started): (i64,String,String) = conn.query_row("SELECT e.seq,e.hash,r.started_unix_ns FROM ledger_events e JOIN event_replay_runs r ON r.id=e.reference WHERE e.kind='event_replay' AND e.reference=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
+    let mut cases = conn
+        .prepare("SELECT case_id,actual_json,error FROM event_replay_cases WHERE run_id=?1 ORDER BY ordinal")
+        .map_err(|e| e.to_string())?;
+    let ids = cases
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let valid_number = |value: &str| value.parse::<u128>().is_ok_and(|n| n.to_string() == value);
+    if !matches!(
+        timing.schema.as_str(),
+        "sese-event-replay-timing-v1" | "sese-event-replay-timing-v2"
+    ) || timing.replay_hash != parent_hash
+        || seq <= &parent_seq
+        || time != &started
+        || ids.is_empty()
+        || ids.len() > 1000
+        || ids.len() != timing.cases.len()
+    {
+        return Err("replay timing mismatch".into());
+    }
+    let mut failed = false;
+    for (entry, (case_id, actual, error)) in timing.cases.iter().zip(ids) {
+        if entry.case_id != case_id {
+            return Err("replay timing mismatch".into());
+        }
+        match (
+            &entry.started_unix_ns,
+            &entry.finished_unix_ns,
+            &entry.elapsed_ns,
+        ) {
+            (Some(start), Some(finish), Some(elapsed))
+                if valid_number(start) && valid_number(finish) && valid_number(elapsed) =>
+            {
+                if timing.schema == "sese-event-replay-timing-v2" {
+                    if failed || error.as_deref() == Some("not run after earlier worker failure") {
+                        return Err("invalid replay timing order".into());
+                    }
+                    if error.is_some() && actual.is_none() {
+                        failed = true;
+                    }
+                }
+            }
+            (None, None, None)
+                if timing.schema == "sese-event-replay-timing-v2"
+                    && failed
+                    && actual.is_none()
+                    && error.as_deref() == Some("not run after earlier worker failure") =>
+            {
+                ()
+            }
+            _ => return Err("invalid replay timing outcome".into()),
+        }
+    }
+    Ok(Some(
+        serde_json::to_value(timing.cases).map_err(|e| e.to_string())?,
+    ))
+}
+
+#[cfg(test)]
+mod replay_timing_boundary_tests {
+    #[test]
+    fn old_timing_allows_multiple_executed_failures() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ledger_events(seq INTEGER,kind TEXT,reference INTEGER,payload TEXT,created_ns TEXT,hash TEXT); CREATE TABLE event_replay_runs(id INTEGER,started_unix_ns TEXT); CREATE TABLE event_replay_cases(run_id INTEGER,ordinal INTEGER,case_id TEXT,actual_json TEXT,error TEXT); INSERT INTO event_replay_runs VALUES(1,'1'); INSERT INTO event_replay_cases VALUES(1,0,'a',NULL,'worker failed'); INSERT INTO event_replay_cases VALUES(1,1,'b',NULL,'worker failed'); INSERT INTO ledger_events VALUES(1,'event_replay',1,'parent','1','parent-hash');").unwrap();
+        let case = |id| serde_json::json!({"case_id":id,"started_unix_ns":"1","finished_unix_ns":"2","elapsed_ns":"1"});
+        let mut payload = serde_json::json!({"schema":"sese-event-replay-timing-v1","replay_hash":"parent-hash","cases":[case("a"),case("b")]});
+        conn.execute(
+            "INSERT INTO ledger_events VALUES(2,'event_replay_timing',1,?1,'1','timing-hash')",
+            [payload.to_string()],
+        )
+        .unwrap();
+        assert!(super::event_replay_timings(&conn, 1).unwrap().is_some());
+        payload["schema"] = serde_json::json!("sese-event-replay-timing-v2");
+        conn.execute(
+            "UPDATE ledger_events SET payload=?1 WHERE seq=2",
+            [payload.to_string()],
+        )
+        .unwrap();
+        assert!(super::event_replay_timings(&conn, 1).is_err());
+        payload["cases"][1] = serde_json::json!({"case_id":"b","started_unix_ns":null,"finished_unix_ns":null,"elapsed_ns":null});
+        conn.execute("UPDATE event_replay_cases SET error='not run after earlier worker failure' WHERE ordinal=1", []).unwrap();
+        conn.execute(
+            "UPDATE ledger_events SET payload=?1 WHERE seq=2",
+            [payload.to_string()],
+        )
+        .unwrap();
+        assert!(super::event_replay_timings(&conn, 1).unwrap().is_some());
+        payload["cases"][0] = serde_json::json!({"case_id":"a","started_unix_ns":null,"finished_unix_ns":null,"elapsed_ns":null});
+        conn.execute("UPDATE event_replay_cases SET error='not run after earlier worker failure' WHERE ordinal=0", []).unwrap();
+        conn.execute(
+            "UPDATE ledger_events SET payload=?1 WHERE seq=2",
+            [payload.to_string()],
+        )
+        .unwrap();
+        assert!(super::event_replay_timings(&conn, 1).is_err());
+    }
+
+    #[test]
+    fn maximum_valid_case_ids_fit_the_timing_record_limit() {
+        use crate::event_abi::{Decision, Event, Verdict, Window};
+        use crate::event_replay::{Case, CaseResult};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE ledger_events(seq INTEGER PRIMARY KEY,kind TEXT,reference INTEGER,payload TEXT,created_ns TEXT,prev TEXT,hash TEXT); CREATE TABLE event_replay_runs(id INTEGER PRIMARY KEY,started_unix_ns TEXT); CREATE TABLE event_replay_cases(run_id INTEGER,ordinal INTEGER,case_id TEXT,actual_json TEXT,error TEXT); INSERT INTO event_replay_runs VALUES(1,'1'); INSERT INTO ledger_events VALUES(1,'event_replay',1,'p','1','GENESIS','parent');").unwrap();
+        let mut results = Vec::new();
+        for index in 0..1000 {
+            let id = format!("{}{:04}", "\u{1}".repeat(252), index);
+            assert_eq!(id.len(), 256);
+            conn.execute(
+                "INSERT INTO event_replay_cases VALUES(1,?1,?2,'{}',NULL)",
+                rusqlite::params![index, id],
+            )
+            .unwrap();
+            results.push(CaseResult {
+                case: Case {
+                    id,
+                    window: Window {
+                        count: 0,
+                        mean: 0.0,
+                        p99_us: 0,
+                        last_error: 0,
+                    },
+                    event: Event {
+                        timestamp_ns: 0,
+                        entity_id: 0,
+                        metric: 0.0,
+                        flags: 0,
+                    },
+                    expected: Verdict {
+                        decision: Decision::Allow,
+                        score: 0.0,
+                        reason: 0,
+                    },
+                },
+                actual: Some(Verdict {
+                    decision: Decision::Allow,
+                    score: 0.0,
+                    reason: 0,
+                }),
+                error: None,
+                passed: true,
+                started_unix_ns: Some("1".into()),
+                finished_unix_ns: Some("2".into()),
+                elapsed_ns: Some("1".into()),
+            });
+        }
+        super::append_event_replay_timings(&conn, 1, "1", &results).unwrap();
+        let length: usize = conn
+            .query_row(
+                "SELECT length(payload) FROM ledger_events WHERE kind='event_replay_timing'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(length > 1_048_576);
+        assert_eq!(
+            super::event_replay_timings(&conn, 1)
+                .unwrap()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1000
+        );
+    }
 }
 
 /// Append a caller assertion; it is never interpreted as replay or promotion evidence.

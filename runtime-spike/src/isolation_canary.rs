@@ -18,7 +18,18 @@ pub fn verify() -> Result<(), String> {
         return Err("isolation user mismatch".into());
     }
     let status = read("/proc/self/status")?;
-    if field(&status, "CapEff:") != Some("0000000000000000")
+    let identity = |key: &str| {
+        field(&status, key).map(|value| value.split_whitespace().collect::<Vec<_>>())
+            == Some(vec!["65534", "65534", "65534", "65534"])
+    };
+    let groups =
+        field(&status, "Groups:").map(|value| value.split_whitespace().collect::<Vec<_>>());
+    if !identity("Uid:") || !identity("Gid:") || groups != Some(vec!["65534"]) {
+        return Err("isolation process identity mismatch".into());
+    }
+    if ["CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:"]
+        .iter()
+        .any(|key| field(&status, key) != Some("0000000000000000"))
         || field(&status, "NoNewPrivs:") != Some("1")
         || field(&status, "Seccomp:") != Some("2")
     {

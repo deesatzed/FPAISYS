@@ -1,5 +1,19 @@
 # Container isolation probe results
 
+On 2026-11-08, a fixed shell in the previously recorded synthetic probe image
+ran on Docker Desktop 29.5.2 (Linux arm64 VM) with the same non-root, no-network,
+read-only-root, dropped-capability, no-new-privileges and resource settings as
+the worker profile. Both `/proc/self/uid_map` and `/proc/self/gid_map` reported
+`0 0 4294967295`: the probe observed an identity mapping in the Docker VM,
+not a distinct remapped user namespace. A separate attempt to create a user
+namespace with `unshare -Ur id` failed with `Operation not permitted`. These
+observations concern that engine and profile; they do not establish the macOS
+host UID mapping, identify which restriction denied `unshare`, or prove escape
+resistance. Docker documents [user namespaces in Enhanced Container Isolation](https://docs.docker.com/desktop/enterprise/hardened-desktop/enhanced-container-isolation/)
+as an additional protection; no availability or licensing conclusion follows
+from this probe. The existing synthetic worker remains non-promotional and
+unclassified candidate execution remains disabled.
+
 On 2026-11-07, `runtime-spike/tests/container_worker_limits.rs` used the local
 worker image `sha256:52d3873e06a8cf862b05bcfdf556d5bf56a69e62a11183efa769c18d06d81dca`
 with the restricted profile. A fixed valid module returned the expected verdict;

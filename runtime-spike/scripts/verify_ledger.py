@@ -135,6 +135,45 @@ def _object(encoded, keys):
     return value
 
 
+def verify_event_replay_timings(conn):
+    seen = set()
+    total = 0
+    for seq, replay_id, payload, created in conn.execute(
+            "SELECT seq,reference,payload,created_ns FROM ledger_events WHERE kind='event_replay_timing' ORDER BY seq"):
+        if replay_id in seen:
+            raise ValueError("duplicate replay timings")
+        seen.add(replay_id)
+        if not isinstance(payload, str) or len(payload.encode("utf-8")) > 4_194_304:
+            raise ValueError("replay timings too large")
+        timing = _object(payload, ("schema", "replay_hash", "cases"))
+        parent = conn.execute("SELECT e.seq,e.hash,r.started_unix_ns FROM ledger_events e JOIN event_replay_runs r ON r.id=e.reference WHERE e.kind='event_replay' AND e.reference=?", (replay_id,)).fetchall()
+        cases = list(conn.execute("SELECT case_id,actual_json,error FROM event_replay_cases WHERE run_id=? ORDER BY ordinal", (replay_id,)))
+        if (len(parent) != 1 or seq <= parent[0][0] or created != parent[0][2]
+                or timing["schema"] not in ("sese-event-replay-timing-v1", "sese-event-replay-timing-v2") or timing["replay_hash"] != parent[0][1]
+                or not isinstance(timing["cases"], list) or not 0 < len(cases) <= 1000 or len(cases) != len(timing["cases"])):
+            raise ValueError("replay timing mismatch")
+        failed = False
+        for case, (case_id, actual, error) in zip(timing["cases"], cases):
+            if not isinstance(case, dict) or set(case) != {"case_id", "started_unix_ns", "finished_unix_ns", "elapsed_ns"} or case["case_id"] != case_id:
+                raise ValueError("replay timing case mismatch")
+            values = [case[key] for key in ("started_unix_ns", "finished_unix_ns", "elapsed_ns")]
+            if all(value is None for value in values):
+                if timing["schema"] != "sese-event-replay-timing-v2" or not failed or actual is not None or error != "not run after earlier worker failure":
+                    raise ValueError("invalid skipped replay timing")
+            else:
+                for value in values:
+                    if (not isinstance(value, str) or not re.fullmatch(r"0|[1-9][0-9]{0,38}", value)
+                            or int(value) > 2**128 - 1):
+                        raise ValueError("invalid replay timing")
+                if timing["schema"] == "sese-event-replay-timing-v2":
+                    if failed or error == "not run after earlier worker failure":
+                        raise ValueError("invalid replay timing order")
+                    if error is not None and actual is None:
+                        failed = True
+        total += 1
+    return total
+
+
 def _uint(value, bits):
     if type(value) is not int or not 0 <= value < (1 << bits):
         raise ValueError("invalid fixture integer")
@@ -1009,7 +1048,9 @@ def verify(database, expected_seq, expected_hash, check_synthetic=False, check_r
         if not found:
             raise ValueError("checkpoint missing or mismatched")
         checked = verify_synthetic_candidates(conn) if check_synthetic else None
-        replays = verify_event_replays(conn) if (check_replays or check_fixtures or check_reviews or check_champions or check_traces or check_followups or check_attestations) else None
+        check_any_replays = check_replays or check_fixtures or check_reviews or check_champions or check_traces or check_followups or check_attestations
+        replays = verify_event_replays(conn) if check_any_replays else None
+        replay_timings = verify_event_replay_timings(conn) if check_any_replays else None
         fixtures = verify_event_fixtures(conn) if (check_fixtures or check_followups) else None
         workers, unrecorded = verify_event_workers(conn) if (check_workers or check_followups) else (None, None)
         observations = verify_event_observations(conn) if (check_observations or check_reviews or check_champions or check_traces or check_followups or check_stream_receipts or check_attestations) else None
@@ -1032,7 +1073,7 @@ def verify(database, expected_seq, expected_hash, check_synthetic=False, check_r
         signed_followups, other_outcomes = verify_signed_followup_links(conn) if check_followups and signature_authorities is not None else (None, None)
         return {"chain_valid": True, "checkpoint_match": True, "head_seq": sequence,
                 "head_hash": previous, "synthetic_candidates_checked": checked,
-                "event_replay_bindings_checked": replays, "event_fixture_cases_checked": fixtures,
+                "event_replay_bindings_checked": replays, "event_replay_timing_bindings_checked": replay_timings, "event_fixture_cases_checked": fixtures,
                 "event_workers_checked": workers, "event_workers_unrecorded": unrecorded,
                 "event_observation_bindings_checked": observations,
                 "event_review_bindings_checked": reviews, "event_outcome_bindings_checked": outcomes,

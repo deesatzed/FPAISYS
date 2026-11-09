@@ -1006,6 +1006,8 @@ fn worker_timeout_crash_and_resource_exhaustion_block_promotion() {
                 reason: failed_event.flags,
             },
         };
+        let mut skipped_case = failed_case.clone();
+        skipped_case.id = "skipped".into();
         let failed = event_replay::replay(
             &mut db,
             if failure == "crash" {
@@ -1015,7 +1017,7 @@ fn worker_timeout_crash_and_resource_exhaustion_block_promotion() {
             },
             &candidate,
             "v1",
-            &[failed_case],
+            &[failed_case, skipped_case],
             if failure == "timeout" {
                 Duration::ZERO
             } else {
@@ -1025,6 +1027,11 @@ fn worker_timeout_crash_and_resource_exhaustion_block_promotion() {
         .unwrap();
         assert!(!failed.passed, "{failure}");
         assert!(failed.cases[0].error.is_some(), "{failure}");
+        assert_eq!(
+            failed.cases[1].error.as_deref(),
+            Some("not run after earlier worker failure"),
+            "{failure}"
+        );
         assert!(
             db.promote_event("domain", &champion, review, "operator")
                 .is_err(),
@@ -1421,7 +1428,7 @@ fn legacy_replay_survives_semantics_migration_and_tampering_is_detected() {
     // Reconstruct the pre-v29 chain, which had no synthetic-candidate events.
     use sha2::{Digest, Sha256};
     conn.execute(
-        "DELETE FROM ledger_events WHERE kind IN ('synthetic_event_candidate','event_replay_worker','event_observation_worker')",
+        "DELETE FROM ledger_events WHERE kind IN ('synthetic_event_candidate','event_replay_worker','event_observation_worker','event_replay_timing')",
         [],
     )
     .unwrap();

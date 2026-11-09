@@ -4,7 +4,8 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY vendor/wasmi/ vendor/wasmi/
-RUN cargo build --locked --release --bin event-worker
+RUN cargo build --locked --release --bin event-worker \
+    && touch -d @0 target/release/event-worker
 
 FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 COPY --from=build /src/target/release/event-worker /event-worker

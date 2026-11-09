@@ -30,6 +30,32 @@ class ContainerLifecycleTests(unittest.TestCase):
         record.update(schema="sese-synthetic-container-intent-v4", state="pending")
         path.write_text(json.dumps(record))
 
+    def test_original_request_reaches_lifecycle_only_if_it_matches_fixed_candidate(self):
+        import synthetic_container_lifecycle as lifecycle
+        request, artifact = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+        with mock.patch.object(lifecycle, "_run_synthetic_locked", return_value={"ok": True}) as execute:
+            result = run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
+                                   docker_host=self.docker_host, request_bytes=request)
+            self.assertEqual(result, {"ok": True})
+            self.assertEqual(execute.call_args.kwargs["request"], request)
+            self.assertEqual(execute.call_args.kwargs["artifact"], artifact)
+            with self.assertRaisesRegex(ValueError, "request does not match"):
+                run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
+                              docker_host=self.docker_host, request_bytes=request + b"x")
+            with self.assertRaisesRegex(ValueError, "request does not match"):
+                run_synthetic("sha256:" + "0" * 64, journal_dir=self.journal_dir,
+                              docker_host=self.docker_host, request_bytes=bytearray(request))
+            self.assertEqual(execute.call_count, 1)
+
+    def test_internal_lifecycle_rejects_untrusted_request_before_any_container_work(self):
+        import synthetic_container_lifecycle as lifecycle
+        request, artifact = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+        with self.assertRaisesRegex(ValueError, "request does not match"):
+            lifecycle._run_synthetic_locked("sha256:" + "0" * 64, journal_dir=self.journal_dir,
+                docker_host=self.docker_host, deadline=time.monotonic() + 1, candidate="throttle",
+                event=(1, 42, 3.0, 4), window=(0, 0.0, 0, 0), request=request + b"x", artifact=artifact)
+        self.assertEqual(list(Path(self.journal_dir).iterdir()), [])
+
     def test_configuration_check_rejects_missing_and_relaxed_restrictions(self):
         container, image, name = "a" * 64, "sha256:" + "b" * 64, "sese-synthetic-" + "c" * 32
         report = {"Id": container, "Image": image, "Mounts": [],
@@ -39,7 +65,7 @@ class ContainerLifecycleTests(unittest.TestCase):
                   "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
                                  "CapAdd": None, "SecurityOpt": ["no-new-privileges"], "Privileged": False,
                                  "PidsLimit": 16, "Memory": 134217728, "MemorySwap": 134217728,
-                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None,
+                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None, "GroupAdd": None,
                                  "Devices": None, "DeviceRequests": None, "PidMode": "", "IpcMode": "private", "UTSMode": ""}}
         check = lambda obj: _configuration_matches(json.dumps(obj), container, image, name)
         self.assertTrue(check(report))
@@ -49,7 +75,7 @@ class ContainerLifecycleTests(unittest.TestCase):
                 ("HostConfig", "MemorySwap", -1), ("HostConfig", "PidsLimit", 0),
                 ("HostConfig", "NanoCpus", 0), ("HostConfig", "Privileged", True),
                 ("HostConfig", "PidMode", "host"), ("HostConfig", "IpcMode", "host"),
-                ("HostConfig", "Binds", ["/host:/host"]), ("Config", "User", "0"),
+                ("HostConfig", "Binds", ["/host:/host"]), ("HostConfig", "GroupAdd", ["0"]), ("Config", "User", "0"),
                 ("State", "Running", True)]:
             with self.subTest(field=field):
                 changed = json.loads(json.dumps(report))
@@ -70,7 +96,7 @@ class ContainerLifecycleTests(unittest.TestCase):
                   "HostConfig": {"NetworkMode": "none", "ReadonlyRootfs": True, "CapDrop": ["ALL"],
                                  "CapAdd": None, "SecurityOpt": ["no-new-privileges"], "Privileged": False,
                                  "PidsLimit": 16, "Memory": 134217728, "MemorySwap": 134217728,
-                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None,
+                                 "NanoCpus": 1000000000, "Binds": None, "VolumesFrom": None, "GroupAdd": None,
                                  "Devices": None, "DeviceRequests": None, "PidMode": "", "IpcMode": "private", "UTSMode": ""}}
         check = lambda obj: _configuration_matches(json.dumps(obj), container, image, name, require_worker_profile=True)
         self.assertTrue(check(report))
@@ -93,7 +119,7 @@ class ContainerLifecycleTests(unittest.TestCase):
         self.assertEqual(result["verdict"], (1, 3.0, 4))
         marker = Path(self.journal_dir) / "worker-started"
         wrapper = Path(self.journal_dir) / "docker-profile-wrapper"
-        for override in ("--entrypoint=/bin/sh", "--env=LD_PRELOAD=/tmp/inject.so"):
+        for override in ("--entrypoint=/bin/sh", "--env=LD_PRELOAD=/tmp/inject.so", "--group-add=0"):
             with self.subTest(override=override):
                 wrapper.write_text("#!/usr/bin/env python3\nimport os,sys\na=sys.argv[1:]\n"
                                    + "if len(a)>2 and a[2]=='start': open(" + repr(str(marker)) + ",'w').close()\n"
@@ -134,6 +160,26 @@ class ContainerLifecycleTests(unittest.TestCase):
                 finally:
                     subprocess.run(base + ["rm", "-f", created], stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=10, check=True)
+
+    @unittest.skipUnless(os.environ.get("SESE_TEST_CANARY_IMAGE"), "requires a worker image with the isolation self-check")
+    def test_worker_self_check_rejects_added_group(self):
+        docker = shutil.which("docker")
+        base = [docker, "--host", self.docker_host]
+        request, _ = _synthetic_request("throttle", (1, 42, 3.0, 4), (0, 0.0, 0, 0))
+        args = ["create", "--pull=never", "--interactive", "--network=none", "--read-only",
+                "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=16",
+                "--memory=128m", "--memory-swap=128m", "--cpus=1", "--user=65534:65534",
+                "--group-add=0", os.environ["SESE_TEST_CANARY_IMAGE"]]
+        created = subprocess.check_output(base + args, text=True, timeout=15).strip()
+        self.assertRegex(created, r"^[0-9a-f]{64}$")
+        try:
+            result = subprocess.run(base + ["start", "--attach", "--interactive", created],
+                                    input=request, capture_output=True, timeout=20)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b"")
+        finally:
+            subprocess.run(base + ["rm", "-f", created], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10, check=True)
 
     @unittest.skipUnless(os.environ.get("SESE_TEST_IMAGE"), "requires a local synthetic worker image")
     def test_refuses_changed_network_before_starting_worker(self):

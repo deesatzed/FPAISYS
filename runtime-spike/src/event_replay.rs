@@ -6,7 +6,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashSet,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Debug)]
@@ -22,6 +22,9 @@ pub struct CaseResult {
     pub actual: Option<Verdict>,
     pub error: Option<String>,
     pub passed: bool,
+    pub started_unix_ns: Option<String>,
+    pub finished_unix_ns: Option<String>,
+    pub elapsed_ns: Option<String>,
 }
 #[derive(Debug)]
 pub struct Report {
@@ -225,27 +228,57 @@ fn replay_with_semantics(
         .map_err(|e| e.to_string())?
         .as_nanos()
         .to_string();
+    let mut stopped = false;
     let results: Vec<_> = cases
         .iter()
-        .map(|case| {
+        .map(|case| -> Result<CaseResult, String> {
+            if stopped {
+                return Ok(CaseResult {
+                    case: case.clone(),
+                    actual: None,
+                    error: Some("not run after earlier worker failure".into()),
+                    passed: false,
+                    started_unix_ns: None,
+                    finished_unix_ns: None,
+                    elapsed_ns: None,
+                });
+            }
+            let case_started = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos()
+                .to_string();
+            let monotonic_start = Instant::now();
             let (actual, error) =
                 match executor.execute(&artifact, &case.window, &case.event, timeout) {
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
                 };
+            if error.is_some() {
+                stopped = true;
+            }
+            let elapsed = monotonic_start.elapsed().as_nanos().to_string();
+            let case_finished = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| e.to_string())?
+                .as_nanos()
+                .to_string();
             let passed = actual.is_some_and(|v| {
                 v.decision == case.expected.decision
                     && v.score.to_bits() == case.expected.score.to_bits()
                     && v.reason == case.expected.reason
             });
-            CaseResult {
+            Ok(CaseResult {
                 case: case.clone(),
                 actual,
                 error,
                 passed,
-            }
+                started_unix_ns: Some(case_started),
+                finished_unix_ns: Some(case_finished),
+                elapsed_ns: Some(elapsed),
+            })
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     executor.verify_unchanged()?;
     let passed = results.iter().all(|c| c.passed);
     let run_id = db.save_event_replay(

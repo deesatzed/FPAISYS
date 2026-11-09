@@ -1,5 +1,41 @@
 # Runtime feasibility assessment (preliminary)
 
+## macOS sandbox probe (2026-11-08–09)
+
+On the current Darwin host, `/usr/bin/sandbox-exec` failed to apply a profile
+inside the tool sandbox (`Operation not permitted`) but a permissive profile
+ran when launched outside it. A deny-by-default profile allowing process
+execution, system-library reads and the worker executable aborted at startup
+(exit 134); its missing entitlement or service was not identified. It is not a
+working worker profile.
+
+A separate `allow default` profile with network and file writes denied, plus
+file-read denials for `/Users`, `/Volumes`, `/private`, `/Library` and
+`/Applications` and a literal exception for the built event worker, ran the
+fixed synthetic throttle request and returned `(1, 3.0, 4)`. Under the same
+profile `/bin/cat` was denied access to a synthetic `/private/tmp` sentinel;
+the unsandboxed positive control read that sentinel. Input and output were
+opened by the parent before applying the profile. Network, other host paths,
+inherited descriptors, process creation, and memory enforcement were not tested
+in this experiment. The profile uses `allow default`, so unlisted operations
+remain allowed. It is not a general filesystem policy, a selected containment
+boundary, or authorization to run untrusted modules. The application does not
+use this profile.
+
+In a later fixed-synthetic probe, a deny-by-default profile importing Apple's
+`system.sb` and allowing worker execution, metadata reads, selected system
+paths, `/dev`, and the worker executable returned the expected throttle
+verdict. With the same profile, a system plist was readable while the synthetic
+private-file sentinel was denied; a test write did not create its target; and a
+shell reported `fork: Operation not permitted`. A loopback listener received a
+positive-control message outside the profile, while the sandboxed `nc` attempt
+exited unsuccessfully and made no connection. The write probe also reported a
+denied working-directory lookup, so its failure is not isolated to a single
+write rule. Apple's imported system policy is not independently inspected or
+pinned, and paths, inherited handles, memory limits, other network mechanisms,
+process behavior, and runtime integration remain unverified. This is not
+authorization to execute untrusted candidates.
+
 Date: 2026-10-29. This is a source review and local availability check, not a security assessment or a working sandbox.
 
 ## Alternatives

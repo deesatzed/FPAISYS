@@ -1236,3 +1236,219 @@ fn typed_cycle_processes_synthetic_event_file_in_order() {
     assert!(!rejected_db.exists());
     std::fs::remove_file(events).unwrap();
 }
+
+#[test]
+fn prepare_review_for_existing_domain_uses_latest_observation_without_writes() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-existing-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("cycle.db");
+    let initial = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db)
+        .args(["--measured", "--prepare-only"])
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let initial_path = dir.join("initial.json");
+    std::fs::write(&initial_path, &initial.stdout).unwrap();
+    let outcome = env!("CARGO_BIN_EXE_sese-outcome");
+    let reject = Command::new(outcome)
+        .arg("event-review-prepared")
+        .arg(&db)
+        .arg(&initial_path)
+        .args(["operator", "reject"])
+        .output()
+        .unwrap();
+    assert!(
+        reject.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reject.stderr)
+    );
+    let observed = Command::new(outcome)
+        .arg("event-builtin-observe")
+        .arg(&db)
+        .args([
+            "typed-cycle",
+            "iteration-2",
+            "allow",
+            "throttle",
+            "measured-v2",
+            "2",
+            "42",
+            "4",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let mut storage = sese_runtime_spike::storage::Storage::open_read_only(&db).unwrap();
+    let before = storage.ledger_checkpoint().unwrap();
+    drop(storage);
+    let replay = first["replay_id"].as_i64().unwrap().to_string();
+    let prepared = Command::new(outcome)
+        .arg("event-review-prepare")
+        .arg(&db)
+        .args(["typed-cycle", &replay])
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_ne!(next["observation_id"], first["observation_id"]);
+    assert_eq!(next["review_recorded"], false);
+    let mut storage = sese_runtime_spike::storage::Storage::open_read_only(&db).unwrap();
+    assert_eq!(storage.ledger_checkpoint().unwrap(), before);
+    drop(storage);
+    let path = dir.join("next.json");
+    std::fs::write(&path, &prepared.stdout).unwrap();
+    let approve = Command::new(outcome)
+        .arg("event-review-prepared")
+        .arg(&db)
+        .arg(&path)
+        .args(["operator", "approve"])
+        .output()
+        .unwrap();
+    assert!(
+        approve.status.success(),
+        "{}",
+        String::from_utf8_lossy(&approve.stderr)
+    );
+    let mut storage = sese_runtime_spike::storage::Storage::open_read_only(&db).unwrap();
+    assert_eq!(
+        storage.current_event_champion("typed-cycle").unwrap(),
+        next["candidate_id"].as_str().unwrap()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn existing_domain_review_remains_available_after_one_hundred_observations() {
+    let dir = std::env::temp_dir().join(format!(
+        "sese-long-domain-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let db = dir.join("cycle.db");
+    let events = dir.join("events.json");
+    let data = serde_json::json!({"schema":"sese-synthetic-events-v1", "events": (0..100).map(|i| serde_json::json!({"timestamp_ns":i+1,"entity_id":42,"metric":4.0,"flags":0})).collect::<Vec<_>>()});
+    std::fs::write(&events, data.to_string()).unwrap();
+    let initial = Command::new(env!("CARGO_BIN_EXE_sese-event-cycle-demo"))
+        .arg(env!("CARGO_BIN_EXE_event-worker"))
+        .arg(&db)
+        .args(["--measured", "--prepare-only", "--events"])
+        .arg(&events)
+        .output()
+        .unwrap();
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&initial.stdout).unwrap();
+    let outcome = env!("CARGO_BIN_EXE_sese-outcome");
+    let observed = Command::new(outcome)
+        .arg("event-builtin-observe")
+        .arg(&db)
+        .args([
+            "typed-cycle",
+            "iteration-101",
+            "allow",
+            "throttle",
+            "measured-v2",
+            "101",
+            "42",
+            "4",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let replay = first["replay_id"].as_i64().unwrap().to_string();
+    let prepared = Command::new(outcome)
+        .arg("event-review-prepare")
+        .arg(&db)
+        .args(["typed-cycle", &replay])
+        .output()
+        .unwrap();
+    assert!(
+        prepared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prepared.stderr)
+    );
+    let next: serde_json::Value = serde_json::from_slice(&prepared.stdout).unwrap();
+    assert_eq!(
+        next["preview"]["observations"].as_array().unwrap().len(),
+        100
+    );
+    assert_eq!(next["preview"]["observations_truncated"], true);
+    let oldest = first["preview"]["observations"][0]["id"]
+        .as_i64()
+        .unwrap()
+        .to_string();
+    let seq = next["checkpoint"]["seq"].as_i64().unwrap().to_string();
+    let hash = next["checkpoint"]["hash"].as_str().unwrap();
+    let excluded = Command::new(outcome)
+        .arg("event-review-at")
+        .arg(&db)
+        .args([
+            "typed-cycle",
+            next["candidate_id"].as_str().unwrap(),
+            &replay,
+            &oldest,
+            "operator",
+            "reject",
+            "h",
+            "b",
+            "p",
+            &seq,
+            hash,
+        ])
+        .output()
+        .unwrap();
+    assert!(!excluded.status.success());
+    assert!(
+        String::from_utf8_lossy(&excluded.stderr).contains("not in the specified preview domain")
+    );
+    let path = dir.join("next.json");
+    std::fs::write(&path, &prepared.stdout).unwrap();
+    let reject = Command::new(outcome)
+        .arg("event-review-prepared")
+        .arg(&db)
+        .arg(&path)
+        .args(["operator", "reject"])
+        .output()
+        .unwrap();
+    assert!(
+        reject.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reject.stderr)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -503,6 +503,11 @@ impl Storage {
         if version <= 36 {
             tx.execute_batch("CREATE TABLE event_preference_receipts(id INTEGER PRIMARY KEY,trace_id INTEGER NOT NULL REFERENCES event_training_traces(id),authority TEXT NOT NULL,payload BLOB NOT NULL,signature BLOB NOT NULL,authority_digest TEXT NOT NULL,checkpoint_seq INTEGER NOT NULL,checkpoint_hash TEXT NOT NULL,created_unix_ns TEXT NOT NULL,UNIQUE(trace_id,signature,authority_digest,checkpoint_seq,checkpoint_hash)); PRAGMA user_version=37;").map_err(|e|e.to_string())?;
         }
+        // This non-unique index accelerates verification without changing evidence or
+        // hiding duplicate records from the integrity checks. It is safe for v37
+        // databases and does not change the logical schema version.
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS ledger_kind_reference_lookup ON ledger_events(kind, reference)")
+            .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
@@ -808,6 +813,7 @@ impl Storage {
         )
         .map_err(|e| e.to_string())?;
         crate::ledger::append_event_worker_provenance(&tx, "event_replay_worker", id, started)?;
+        crate::ledger::append_event_replay_timings(&tx, id, started, results)?;
         tx.commit().map_err(|e| e.to_string())?;
         Ok(id)
     }
@@ -1222,7 +1228,8 @@ impl Storage {
             }
             cases
         };
-        let value = serde_json::json!({"schema":"sese-synthetic-event-replay-inspection-v1","id":id,"candidate_id":verified.candidate_id,"fixture_version":verified.pack_version,"fixture_digest":verified.pack_digest,"state_semantics":verified.state_semantics,"passed":verified.passed,"started_unix_ns":started,"worker":{"path":worker_path,"sha256":worker_sha256},"cases":cases,"synthetic":true});
+        let timings = crate::ledger::event_replay_timings(conn, id)?;
+        let value = serde_json::json!({"schema":"sese-synthetic-event-replay-inspection-v1","id":id,"candidate_id":verified.candidate_id,"fixture_version":verified.pack_version,"fixture_digest":verified.pack_digest,"state_semantics":verified.state_semantics,"passed":verified.passed,"started_unix_ns":started,"worker":{"path":worker_path,"sha256":worker_sha256},"cases":cases,"case_timings":timings,"synthetic":true});
         Ok(value)
     }
     fn verify_event_replay_conn(
@@ -1470,11 +1477,7 @@ impl Storage {
             }
         }
         if let Some(domain) = preview_domain {
-            let count: i64 = tx.query_row("SELECT count(*) FROM (SELECT id FROM event_observations WHERE domain=?1 LIMIT 101)", [domain], |r| r.get(0)).map_err(|e|e.to_string())?;
-            if count > 100 {
-                return Err("review preview exceeds 100 observations".into());
-            }
-            let included: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM (SELECT id FROM event_observations WHERE domain=?1 ORDER BY id LIMIT 100) WHERE id=?2)", params![domain, observation], |r| r.get(0)).map_err(|e|e.to_string())?;
+            let included: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM (SELECT id FROM event_observations WHERE domain=?1 ORDER BY id DESC LIMIT 100) WHERE id=?2)", params![domain, observation], |r| r.get(0)).map_err(|e|e.to_string())?;
             if !included {
                 return Err("observation is not in the specified preview domain".into());
             }
@@ -1718,9 +1721,14 @@ impl Storage {
         domain: &str,
     ) -> Result<serde_json::Value, String> {
         let replay = Self::inspect_event_replay_conn(conn, replay)?;
-        let page = Self::inspect_event_observations_conn(conn, domain, 0)?;
+        // Keep the latest 100 observations while preserving ascending display order.
+        let after: Option<i64> = conn.query_row(
+            "SELECT id FROM event_observations WHERE domain=?1 ORDER BY id DESC LIMIT 1 OFFSET 100",
+            [domain], |row| row.get(0),
+        ).optional().map_err(|e| e.to_string())?;
+        let page = Self::inspect_event_observations_conn(conn, domain, after.unwrap_or(0))?;
         if !page["next_after_id"].is_null() {
-            return Err("review preview exceeds 100 observations".into());
+            return Err("review preview changed unexpectedly".into());
         }
         let candidate = replay["candidate_id"]
             .as_str()
@@ -1740,9 +1748,11 @@ impl Storage {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .map_err(|e| e.to_string())?;
-        Ok(
-            serde_json::json!({"schema":"sese-synthetic-review-preview-v1","replay":replay,"followup":followup,"observations":page["observations"],"checkpoint":{"seq":seq,"hash":hash},"synthetic":true}),
-        )
+        let mut preview = serde_json::json!({"schema":"sese-synthetic-review-preview-v1","replay":replay,"followup":followup,"observations":page["observations"],"checkpoint":{"seq":seq,"hash":hash},"synthetic":true});
+        if after.is_some() {
+            preview["observations_truncated"] = serde_json::json!(true);
+        }
+        Ok(preview)
     }
 
     /// Compare stored experimental container evidence with local review evidence in one read snapshot.

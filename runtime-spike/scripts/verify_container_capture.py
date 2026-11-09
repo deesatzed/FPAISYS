@@ -7,7 +7,7 @@ import sqlite3
 from pathlib import Path
 
 from container_review_compare import compare, verify_report_receipts
-from verify_ledger import digest, verify_event_fixture, verify_event_observations, verify_event_replays
+from verify_ledger import digest, verify_event_fixture, verify_event_observations, verify_event_replays, verify_event_replay_timings
 
 
 def _load(value):
@@ -68,6 +68,7 @@ def verify_capture(database, capture_seq, checkpoint_seq, checkpoint_hash):
                 raise ValueError("captured report digest mismatch")
         replay, shadow = _load(bundle["replay_report"]), _load(bundle["shadow_report"])
         verify_event_replays(conn)
+        verify_event_replay_timings(conn)
         verify_event_fixture(conn, reference)
         verify_event_observations(conn)
         row = conn.execute("SELECT candidate_id,pack_version,pack_digest,state_semantics,passed FROM event_replay_runs WHERE id=?", (reference,)).fetchone()

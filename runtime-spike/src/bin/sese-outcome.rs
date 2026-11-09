@@ -33,6 +33,14 @@ struct PreparedCard {
     bridge: String,
     proposal: String,
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputReviewCard {
+    schema: String,
+    human: String,
+    bridge: String,
+    proposal: String,
+}
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PreparedEvaluation {
@@ -114,7 +122,7 @@ fn decode_lower_hex<const N: usize>(text: &str) -> Result<[u8; N], &'static str>
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.len() < 2 {
-        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-propose-threshold, event-propose-from-fixture, event-proposal-inspect, event-register, event-review, event-review-preview, event-review-prepared, event-review-at, event-container-evaluate, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
+        return Err("usage: sese-outcome COMMAND DB [ARGS]; commands: status, resolve, export, event-init, event-builtin-register, event-builtin-replay, event-builtin-observe, event-propose-threshold, event-propose-from-fixture, event-proposal-inspect, event-register, event-review, event-review-preview, event-review-prepare, event-review-prepared, event-review-at, event-container-evaluate, event-container-replay, event-container-replay-inspect, event-container-review-preview, event-container-observation, event-container-observation-inspect, event-container-shadow, event-container-shadow-inspect, event-container-assert, event-container-capture, event-container-assert-inspect, event-inspect, event-replay-inspect, event-observations, event-history, event-training-export, event-evidence-check, event-evidence-policy-check, event-common-policy-check, event-reward-preview, event-evidence-export, event-evidence-verify, event-attestation-check, event-attestation-record, event-attestation-inspect, event-attestation-recheck, event-preference-check, event-preference-record, event-preference-inspect, event-preference-recheck, event-followup-check, event-followup-pin, event-followup-selected-check, event-followup-record, event-followup-inspect, event-followup-outcome-check, event-signed-followup-check, event-signed-followup-record, event-signed-followup-recheck, event-retained-followup-check, event-trace-record, event-trace-inspect, event-trace-compare-wat, event-trace-eligibility, event-pin, event-pin-match, event-bootstrap, event-champion, event-promote, event-rollback, event-status, event-resolve, event-export, window-inspect, window-status, window-resolve, window-export, window-pin, window-pin-match, window-register, window-bootstrap, window-champion, window-promote, window-rollback, checkpoint, verify-checkpoint; see README".into());
     }
     if args[0] == "event-init" && args.len() == 2 {
         std::fs::OpenOptions::new()
@@ -134,6 +142,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "event-training-export"
             | "event-proposal-inspect"
             | "event-container-review-preview"
+            | "event-review-prepare"
             | "event-container-observation-inspect"
     ) {
         Storage::open_read_only(std::path::Path::new(&args[1]))?
@@ -1108,6 +1117,71 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "event-review-preview" if args.len() == 4 => {
             println!("{}", db.event_review_preview(args[3].parse()?, &args[2])?)
+        }
+        "event-review-prepare" if args.len() == 4 || args.len() == 5 => {
+            let replay_id: i64 = args[3].parse()?;
+            let preview = db.event_review_preview(replay_id, &args[2])?;
+            let candidate_id = preview["replay"]["candidate_id"]
+                .as_str()
+                .ok_or("invalid replay candidate")?
+                .to_owned();
+            let state_semantics = preview["replay"]["state_semantics"]
+                .as_str()
+                .ok_or("invalid replay semantics")?
+                .to_owned();
+            let observation = preview["observations"]
+                .as_array()
+                .and_then(|v| v.last())
+                .ok_or("no observation for domain")?;
+            let observation_id = observation["id"].as_i64().ok_or("invalid observation")?;
+            let champion_id = db.current_event_champion(&args[2])?;
+            if observation["shadow_id"] != candidate_id || observation["champion_id"] != champion_id
+            {
+                return Err(
+                    "latest observation does not match candidate and current champion".into(),
+                );
+            }
+            let card = if args.len() == 5 {
+                let input: InputReviewCard =
+                    serde_json::from_slice(&read_bounded_file(&args[4], 65_536)?)?;
+                if input.schema != "sese-synthetic-review-card-v1"
+                    || [&input.human, &input.bridge, &input.proposal]
+                        .iter()
+                        .any(|s| s.trim().is_empty() || s.len() > 16_384)
+                {
+                    return Err("invalid review card".into());
+                }
+                PreparedCard {
+                    human: input.human,
+                    bridge: input.bridge,
+                    proposal: input.proposal,
+                }
+            } else {
+                PreparedCard {
+                    human: "Review the synthetic decision.".into(),
+                    bridge: "Compare typed replay and shadow results.".into(),
+                    proposal: "Consider the recorded synthetic candidate.".into(),
+                }
+            };
+            let (seq, hash) = db.ledger_checkpoint()?;
+            if preview["checkpoint"] != serde_json::json!({"seq":seq,"hash":hash}) {
+                return Err("evidence changed while preparing review; retry".into());
+            }
+            let prepared = PreparedEvaluation {
+                schema: "sese-prepared-synthetic-evaluation-v1".into(),
+                synthetic: true,
+                review_recorded: false,
+                domain: args[2].clone(),
+                candidate_id,
+                champion_id,
+                replay_id,
+                observation_id,
+                state_semantics,
+                checkpoint: preview["checkpoint"].clone(),
+                preview,
+                card,
+            };
+            println!("{}", serde_json::to_string(&prepared)?);
         }
         "event-review-prepared" if args.len() == 5 => {
             let mut source: serde_json::Value =
